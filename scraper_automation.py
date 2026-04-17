@@ -22,14 +22,14 @@ USER_AGENT = (
 )
 
 REVENUE_RELEASE_URL = (
-    "[https://revenue.nebraska.gov/sites/default/files/doc/news-release/gen-fund/](https://revenue.nebraska.gov/sites/default/files/doc/news-release/gen-fund/)"
+    "https://revenue.nebraska.gov/sites/default/files/doc/news-release/gen-fund/"
     "{year}/General_Fund_Receipts_News_Release_{month_name}_{year}_Final_Copy.pdf"
 )
 
-GF_STATUS_URL = "[https://nebraskalegislature.gov/FloorDocs/Current/PDF/Budget/status.pdf](https://nebraskalegislature.gov/FloorDocs/Current/PDF/Budget/status.pdf)"
-LEG_BUDGET_URL_TEMPLATE = "[https://nebraskalegislature.gov/pdf/reports/fiscal/](https://nebraskalegislature.gov/pdf/reports/fiscal/){year}budget.pdf"
-LFO_DIRECTORY_VOL1_URL = "[https://nebraskalegislature.gov/pdf/reports/fiscal/funddescriptions1](https://nebraskalegislature.gov/pdf/reports/fiscal/funddescriptions1)_{year}.pdf"
-LFO_DIRECTORY_VOL2_URL = "[https://nebraskalegislature.gov/pdf/reports/fiscal/funddescriptions2](https://nebraskalegislature.gov/pdf/reports/fiscal/funddescriptions2)_{year}.pdf"
+GF_STATUS_URL = "https://nebraskalegislature.gov/FloorDocs/Current/PDF/Budget/status.pdf"
+LEG_BUDGET_URL_TEMPLATE = "https://nebraskalegislature.gov/pdf/reports/fiscal/{year}budget.pdf"
+LFO_DIRECTORY_VOL1_URL = "https://nebraskalegislature.gov/pdf/reports/fiscal/funddescriptions1_{year}.pdf"
+LFO_DIRECTORY_VOL2_URL = "https://nebraskalegislature.gov/pdf/reports/fiscal/funddescriptions2_{year}.pdf"
 
 
 def download_file(url, dest_path):
@@ -63,7 +63,7 @@ def get_latest_oip_url():
         fiscal_month = cal_month - 6 if cal_month >= 7 else cal_month + 6
         fm_str = f"{fiscal_month:02d}"
         url = (
-            "[https://das.nebraska.gov/accounting/docs/](https://das.nebraska.gov/accounting/docs/)"
+            "https://das.nebraska.gov/accounting/docs/"
             f"NE_DAS_Accounting-Operating_Investment_Pool_OIP_Report_{cal_year}-{fm_str}.xlsx"
         )
         try:
@@ -269,7 +269,7 @@ def push_to_sheet(data, sheet_id, sheet_name="Sheet1", credentials_path="credent
 
     creds = service_account.Credentials.from_service_account_file(
         credentials_path,
-        scopes=["[https://www.googleapis.com/auth/spreadsheets](https://www.googleapis.com/auth/spreadsheets)"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
 
     try:
