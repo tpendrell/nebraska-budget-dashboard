@@ -213,45 +213,36 @@ def get_target_month(month_str=None):
         dt = first_of_month - timedelta(days=1)  # last day of prior month
     return dt.year, dt.month, dt.strftime("%B")  # (2026, 3, "March")
 
-
 # ─────────────────────────────────────────────
-# STEP 1: FETCH OIP DATA
+# STEP 1: FETCH OIP REPORT (WITH FISCAL MONTH FIX)
 # ─────────────────────────────────────────────
 
-def fetch_oip(year, month, work_dir):
-    """
-    Download the OIP XLSX from DAS. Falls back to PDF if XLSX not available.
-    Returns the local file path or None.
-    """
-    xlsx_url = OIP_XLSX_URL.format(year=year, month=month)
-    xlsx_path = os.path.join(work_dir, f"oip_{year}_{month:02d}.xlsx")
-
-    if download_file(xlsx_url, xlsx_path):
-        return xlsx_path
-
-    # Fallback: try PDF
-    year_short = str(year)[-2:]
-    pdf_url = OIP_PDF_URL.format(month=month, year_short=year_short)
-    pdf_path = os.path.join(work_dir, f"oip_{year}_{month:02d}.pdf")
-
-    if download_file(pdf_url, pdf_path):
-        print("  ⚠️  Got PDF instead of XLSX — will need pdftotext parsing")
-        return pdf_path
-
-    print("  ❌  OIP report not yet available for this period")
-    return None
-
-
-def fetch_fund_summary(year, month, work_dir):
-    """Download the Fund Summary by Fund PDF from DAS."""
-    url = FUND_SUMMARY_URL.format(year=year, month=month)
-    path = os.path.join(work_dir, f"fund_summary_{year}_{month:02d}.pdf")
-
-    if download_file(url, path):
-        return path
-    print("  ❌  Fund Summary not yet available for this period")
-    return None
-
+def get_latest_oip_url():
+    import datetime
+    now = datetime.datetime.now()
+    
+    # Nebraska Fiscal Year starts in July.
+    # To get the latest report, we usually look back 1-2 months.
+    # We'll target the previous month to ensure the data is finalized.
+    target_date = now - datetime.timedelta(days=32)
+    
+    cal_month = target_date.month
+    cal_year = target_date.year
+    
+    # Convert Calendar Month to Nebraska Fiscal Month
+    # July (7) -> 1, August (8) -> 2 ... January (1) -> 7, March (3) -> 9
+    if cal_month >= 7:
+        fiscal_month = cal_month - 6
+    else:
+        fiscal_month = cal_month + 6
+        
+    # Format fiscal month as 01, 02, etc.
+    fm_str = f"{fiscal_month:02d}"
+    
+    # The URL uses the CALENDAR YEAR of the report and the FISCAL MONTH
+    url = f"https://das.nebraska.gov/accounting/docs/NE_DAS_Accounting-Operating_Investment_Pool_OIP_Report_{cal_year}-{fm_str}.xlsx"
+    
+    return url, f"{target_date.strftime('%B %Y')}"
 
 # ─────────────────────────────────────────────
 # STEP 2: FETCH REVENUE DATA
