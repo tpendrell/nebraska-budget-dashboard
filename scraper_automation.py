@@ -214,35 +214,33 @@ def get_target_month(month_str=None):
     return dt.year, dt.month, dt.strftime("%B")  # (2026, 3, "March")
 
 # ─────────────────────────────────────────────
-# STEP 1: FETCH OIP REPORT (WITH FISCAL MONTH FIX)
+# STEP 1: FETCH OIP REPORT (UPDATED FISCAL LOGIC)
 # ─────────────────────────────────────────────
 
 def get_latest_oip_url():
     import datetime
     now = datetime.datetime.now()
     
-    # Nebraska Fiscal Year starts in July.
-    # To get the latest report, we usually look back 1-2 months.
-    # We'll target the previous month to ensure the data is finalized.
+    # We look back roughly 1.5 months to ensure the State has finalized the report.
+    # Mid-April 2026 should be looking for the March 2026 report.
     target_date = now - datetime.timedelta(days=32)
     
     cal_month = target_date.month
     cal_year = target_date.year
     
-    # Convert Calendar Month to Nebraska Fiscal Month
-    # July (7) -> 1, August (8) -> 2 ... January (1) -> 7, March (3) -> 9
+    # NEBRASKA FISCAL MONTH CONVERSION:
+    # July=01, Aug=02, Sep=03, Oct=04, Nov=05, Dec=06, Jan=07, Feb=08, Mar=09, Apr=10, May=11, Jun=12
     if cal_month >= 7:
         fiscal_month = cal_month - 6
     else:
         fiscal_month = cal_month + 6
         
-    # Format fiscal month as 01, 02, etc.
     fm_str = f"{fiscal_month:02d}"
     
-    # The URL uses the CALENDAR YEAR of the report and the FISCAL MONTH
+    # This builds the URL for the March 2026 report (Calendar 2026, Fiscal 09)
     url = f"https://das.nebraska.gov/accounting/docs/NE_DAS_Accounting-Operating_Investment_Pool_OIP_Report_{cal_year}-{fm_str}.xlsx"
     
-    return url, f"{target_date.strftime('%B %Y')}"
+    return url, target_date.strftime('%B %Y')
 
 # ─────────────────────────────────────────────
 # STEP 2: FETCH REVENUE DATA
