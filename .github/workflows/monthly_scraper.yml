@@ -26,10 +26,6 @@ jobs:
   scrape-and-update:
     runs-on: ubuntu-latest
     
-    # Fixes Exit Code 128 by granting write permissions to the repository
-    permissions:
-      contents: write
-    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -59,20 +55,3 @@ jobs:
             MONTH_ARG="--month ${{ github.event.inputs.target_month }}"
           fi
           python3 scraper_automation.py $MONTH_ARG --sheet-id "$GOOGLE_SHEET_ID"
-
-      - name: Upload data artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dashboard-data-${{ github.run_id }}
-          path: dashboard_data.json
-          retention-days: 90
-
-      - name: Commit updated data (if tracked)
-        run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          if [ -f dashboard_data.json ]; then
-            git add dashboard_data.json
-            git diff --cached --quiet || git commit -m "chore: update dashboard data $(date +%Y-%m-%d)"
-            git push
-          fi
