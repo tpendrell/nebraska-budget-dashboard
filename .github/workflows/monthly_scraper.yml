@@ -18,9 +18,17 @@ on:
         required: false
         type: string
 
+# Fixes the Node.js 20 deprecation warning
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   scrape-and-update:
     runs-on: ubuntu-latest
+    
+    # Fixes Exit Code 128 by granting write permissions to the repository
+    permissions:
+      contents: write
     
     steps:
       - name: Checkout repository
