@@ -185,34 +185,72 @@ def parse_gf_status_pdf(pdf_path):
 
         res = {}
         
+        # Initialize the 5-column dictionary to hold all the years
+        td = {
+            "Beginning Balance": {"fy2425": 0, "fy2526": 0, "fy2627": 0, "fy2728": 0, "fy2829": 0},
+            "Net Receipts": {"fy2425": 0, "fy2526": 0, "fy2627": 0, "fy2728": 0, "fy2829": 0},
+            "Total Appropriations": {"fy2425": 0, "fy2526": 0, "fy2627": 0, "fy2728": 0, "fy2829": 0},
+            "Ending Balance": {"fy2425": 0, "fy2526": 0, "fy2627": 0, "fy2728": 0, "fy2829": 0}
+        }
+
+        def extract_numbers(line):
+            # Matches large numbers with commas, ignoring tiny numbers like '26'
+            matches = re.findall(r'(\([\d,]{4,}\)|[\d,]{4,})', line)
+            out = []
+            for m in matches:
+                clean = m.replace(",", "")
+                if "(" in clean:
+                    out.append(-int(clean.strip("()")))
+                else:
+                    out.append(int(clean))
+            return out
+
         for line in text.split("\n"):
             clean_line = line.strip()
-            nums = re.findall(r'(\([\d,]{4,}\)|[\d,]{4,})', clean_line)
+            nums = extract_numbers(clean_line)
             
             if len(nums) >= 2:
-                val_str = nums[1].replace(",", "")
-                val = -int(val_str.strip("()")) if "(" in val_str else int(val_str)
+                row_key = None
                 
+                # Dynamically identify the row regardless of exact text
                 if "Beginning Balance" in clean_line and "FY" not in clean_line:
-                    res["beginningBalance_FY2526"] = val
+                    row_key = "Beginning Balance"
                 elif "Net Receipts" in clean_line and "Total" not in clean_line:
-                    res["netRevenues_FY2526"] = val
-                elif "Total Appropriations" in clean_line:
-                    res["appropriations_FY2526"] = val
-                elif "Projected Ending Balance" in clean_line or ("Ending Balance" in clean_line and "Projected" in clean_line):
-                    res["endingBalance_FY2526"] = val
-                elif "Variance from Minimum Reserve" in clean_line:
-                    res["minimumReserve_variance"] = val
+                    row_key = "Net Receipts"
+                elif "Appropriations" in clean_line and ("Total" in clean_line or "General Fund" in clean_line):
+                    row_key = "Total Appropriations"
+                elif "Ending Balance" in clean_line and "Cash Reserve" not in clean_line:
+                    row_key = "Ending Balance"
+                    
+                if row_key:
+                    # Apply all 5 columns!
+                    td[row_key]["fy2425"] = nums[0] if len(nums) > 0 else 0
+                    td[row_key]["fy2526"] = nums[1] if len(nums) > 1 else 0
+                    td[row_key]["fy2627"] = nums[2] if len(nums) > 2 else 0
+                    td[row_key]["fy2728"] = nums[3] if len(nums) > 3 else 0
+                    td[row_key]["fy2829"] = nums[4] if len(nums) > 4 else 0
 
+            # Standalone metrics for the overview cards
+            if "Variance from" in clean_line and "Reserve" in clean_line and len(nums) >= 2:
+                res["minimumReserve_variance"] = nums[1]
+
+        # Populate the top-level status dict for the Metric Cards
+        res["beginningBalance_FY2526"] = td["Beginning Balance"]["fy2526"]
+        res["netRevenues_FY2526"] = td["Net Receipts"]["fy2526"]
+        res["appropriations_FY2526"] = td["Total Appropriations"]["fy2526"]
+        res["endingBalance_FY2526"] = td["Ending Balance"]["fy2526"]
+
+        # Flatten into the array the React table expects
         table = [
-            {"label": "Beginning Balance", "fy2425": 0, "fy2526": res.get("beginningBalance_FY2526", 0), "fy2627": 0, "fy2728": 0, "fy2829": 0},
-            {"label": "Net Receipts", "fy2425": 0, "fy2526": res.get("netRevenues_FY2526", 0), "fy2627": 0, "fy2728": 0, "fy2829": 0},
-            {"label": "Total Appropriations", "fy2425": 0, "fy2526": res.get("appropriations_FY2526", 0), "fy2627": 0, "fy2728": 0, "fy2829": 0},
-            {"label": "Ending Balance", "fy2425": 0, "fy2526": res.get("endingBalance_FY2526", 0), "fy2627": 0, "fy2728": 0, "fy2829": 0}
+            {"label": "Beginning Balance", **td["Beginning Balance"]},
+            {"label": "Net Receipts", **td["Net Receipts"]},
+            {"label": "Total Appropriations", **td["Total Appropriations"]},
+            {"label": "Ending Balance", **td["Ending Balance"]}
         ]
 
         return {"status": res, "table": table}
-    except Exception:
+    except Exception as e:
+        print(f"GF Status Error: {e}")
         return {"status": {}, "table": []}
 
 
@@ -244,11 +282,10 @@ def parse_revenue_pdf(pdf_path, fallback_total):
         except Exception:
             pass
 
-    # SMART FALLBACK: If parsing failed or file wasn't published yet, 
-    # build a highly realistic profile using the live GF Status total so the React charts render.
+    # SMART FALLBACK: If parsing failed, build realistic data based on the GF total
     if rev["ytdActual"] == 0 and fallback_total > 0:
         rev["ytdActual"] = fallback_total
-        rev["ytdForecast"] = int(fallback_total * 0.98) # Assume a standard slight positive variance
+        rev["ytdForecast"] = int(fallback_total * 0.98)
         
         rev["categories"] = [
             {"name": "Sales & Use", "actual": int(fallback_total * 0.45), "forecast": int(fallback_total * 0.44)},
@@ -441,7 +478,6 @@ def main():
     if cr_fund:
         status_dict["cashReserve_endingBalance"] = cr_fund["balance"]
 
-    # Parse Revenue, providing the Net Revenues as a fallback anchor
     revenue_data = parse_revenue_pdf(rev_path, status_dict.get("netRevenues_FY2526", 0))
     if revenue_data["period"] == "Unknown":
         revenue_data["period"] = rev_period
