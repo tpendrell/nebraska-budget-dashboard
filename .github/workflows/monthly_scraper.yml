@@ -1,0 +1,70 @@
+# .github/workflows/monthly_scraper.yml
+# Nebraska Public Budget Dashboard — Automated Monthly Data Refresh
+#
+# Runs on the 18th of each month (DAS typically publishes OIP by mid-month)
+# Can also be triggered manually via workflow_dispatch
+
+name: Monthly Data Scraper
+
+on:
+  schedule:
+    # Run at 10:00 AM CT (16:00 UTC) on the 18th of every month
+    # DAS publishes OIP reports ~15th of the month for the prior month
+    - cron: '0 16 18 * *'
+  workflow_dispatch:
+    inputs:
+      target_month:
+        description: 'Target month (YYYY-MM format, e.g., 2026-03)'
+        required: false
+        type: string
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install openpyxl google-api-python-client google-auth
+          sudo apt-get install -y poppler-utils  # for pdftotext
+
+      - name: Set up Google credentials
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          echo "$GOOGLE_CREDENTIALS" > credentials.json
+
+      - name: Run scraper
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: |
+          MONTH_ARG=""
+          if [ -n "${{ github.event.inputs.target_month }}" ]; then
+            MONTH_ARG="--month ${{ github.event.inputs.target_month }}"
+          fi
+          python3 scraper_automation.py $MONTH_ARG --sheet-id "$GOOGLE_SHEET_ID"
+
+      - name: Upload data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-data-${{ github.run_id }}
+          path: dashboard_data.json
+          retention-days: 90
+
+      - name: Commit updated data (if tracked)
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          if [ -f dashboard_data.json ]; then
+            git add dashboard_data.json
+            git diff --cached --quiet || git commit -m "chore: update dashboard data $(date +%Y-%m-%d)"
+            git push
+          fi
