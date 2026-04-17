@@ -2,6 +2,36 @@
 """
 Nebraska Public Budget Dashboard — Automated Data Scraper
 ==========================================================
+
+CHANGELOG — Final Fix
+---------------------
+Root cause of production bugs (min reserve variance showing +$6.3M instead of
+-$125.6M, GF ending balance showing $829.5M instead of $375.3M):
+
+    The old parse_gf_status_pdf() matched rows labeled "Beginning Balance" and
+    "Ending Balance" — but those labels appear in BOTH the General Fund
+    Financial Status table (page 4) AND the Cash Reserve Fund Table 1 (page 5).
+    The regex grabbed whichever matched last, which was the CRF table.
+
+    The GF Status table actually uses these distinctive labels:
+      - "Unobligated Beginning Balance"         (not just "Beginning Balance")
+      - "General Fund Net Revenues"             (subtotal row)
+      - "General Fund Appropriations"           (post-adjustment subtotal)
+      - "Ending balance (per Financial Status)" (note: lowercase 'b')
+      - "Excess (shortfall) from Minimum Reserve"
+    The old parser never matched any of these exactly, so it silently fell
+    back to the CRF rows.
+
+This version:
+    1. parse_gf_status_pdf() uses distinctive row labels that only exist in
+       the GF Financial Status table. Isolates the section between the GF
+       Status header and the Cash Reserve Fund header. Fails loud via sanity
+       checks if output still looks like CRF data.
+    2. parse_revenue_pdf() parses NEFAB Table 3 from the biennial budget PDF
+       directly. Removes the pro-rata fallback that fabricated fake identical
+       forecasts across categories.
+    3. parse_biennial_budget_agencies() anchors to Table 12 "Total" rows to
+       avoid mixing Enacted and Committee Rec columns.
 """
 
 import os
@@ -10,6 +40,7 @@ import json
 import argparse
 import tempfile
 import datetime
+import subprocess
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -29,6 +60,10 @@ REVENUE_RELEASE_URL = (
 GF_STATUS_URL = "https://nebraskalegislature.gov/FloorDocs/Current/PDF/Budget/status.pdf"
 LEG_BUDGET_URL_TEMPLATE = "https://nebraskalegislature.gov/pdf/reports/fiscal/{year}budget.pdf"
 
+
+# ---------------------------------------------------------------------------
+# Fetch helpers (unchanged from original — these work correctly)
+# ---------------------------------------------------------------------------
 
 def download_file(url, dest_path):
     try:
@@ -118,6 +153,10 @@ def fetch_revenue_release(work_dir):
     return None, "Unknown"
 
 
+# ---------------------------------------------------------------------------
+# OIP parser
+# ---------------------------------------------------------------------------
+
 def parse_oip_for_dashboard(xlsx_path):
     import openpyxl
 
@@ -149,339 +188,578 @@ def parse_oip_for_dashboard(xlsx_path):
         elif fid == "11000":
             title = "Cash Reserve Fund"
 
-        funds.append(
-            {
-                "id": fid,
-                "title": title,
-                "balance": bal,
-                "interest": interest,
-            }
-        )
+        funds.append({
+            "id": fid,
+            "title": title,
+            "balance": bal,
+            "interest": interest,
+        })
+
+    # Compute effective yield from the data rather than hardcoding.
+    # totalInterest in OIP is typically a single-month figure; annualize ×12.
+    yield_pct = "0.00%"
+    if total_bal > 0 and total_interest != 0:
+        annualized = abs(total_interest) * 12
+        yield_pct = f"{annualized / total_bal * 100:.2f}%"
 
     return {
         "macro": {
             "totalBalance": total_bal,
             "totalInterest": total_interest,
             "activeFunds": active_count,
-            "effectiveYield": "3.08%",
+            "effectiveYield": yield_pct,
         },
         "funds": funds,
     }
 
 
-def parse_gf_status_pdf(pdf_path):
-    import subprocess
-    import re
+# ---------------------------------------------------------------------------
+# Shared PDF helpers
+# ---------------------------------------------------------------------------
 
-    if not pdf_path:
-        return {"status": {}, "table": []}
-
+def _pdf_to_text(pdf_path):
+    """Run pdftotext -layout; return stdout or '' on failure."""
     try:
-        text = subprocess.run(
+        return subprocess.run(
             ["pdftotext", "-layout", pdf_path, "-"],
             capture_output=True,
             text=True,
+            timeout=60,
         ).stdout
-
-        res = {}
-        
-        td = {
-            "Beginning Balance": {"fy2425": 0, "fy2526": 0, "fy2627": 0, "fy2728": 0, "fy2829": 0},
-            "Net Receipts": {"fy2425": 0, "fy2526": 0, "fy2627": 0, "fy2728": 0, "fy2829": 0},
-            "Total Appropriations": {"fy2425": 0, "fy2526": 0, "fy2627": 0, "fy2728": 0, "fy2829": 0},
-            "Ending Balance": {"fy2425": 0, "fy2526": 0, "fy2627": 0, "fy2728": 0, "fy2829": 0}
-        }
-
-        def extract_numbers(line):
-            matches = re.findall(r'(\([\d,]{4,}\)|[\d,]{4,})', line)
-            out = []
-            for m in matches:
-                clean = m.replace(",", "")
-                if "(" in clean:
-                    out.append(-int(clean.strip("()")))
-                else:
-                    out.append(int(clean))
-            return out
-
-        for line in text.split("\n"):
-            clean_line = line.strip()
-            nums = extract_numbers(clean_line)
-            
-            if len(nums) >= 2:
-                row_key = None
-                
-                if "Beginning Balance" in clean_line and "FY" not in clean_line:
-                    row_key = "Beginning Balance"
-                elif "Net Receipts" in clean_line and "Total" not in clean_line:
-                    row_key = "Net Receipts"
-                elif "Appropriations" in clean_line and ("Total" in clean_line or "General Fund" in clean_line):
-                    row_key = "Total Appropriations"
-                elif "Ending Balance" in clean_line and "Cash Reserve" not in clean_line:
-                    row_key = "Ending Balance"
-                    
-                if row_key:
-                    td[row_key]["fy2425"] = nums[0] if len(nums) > 0 else 0
-                    td[row_key]["fy2526"] = nums[1] if len(nums) > 1 else 0
-                    td[row_key]["fy2627"] = nums[2] if len(nums) > 2 else 0
-                    td[row_key]["fy2728"] = nums[3] if len(nums) > 3 else 0
-                    td[row_key]["fy2829"] = nums[4] if len(nums) > 4 else 0
-
-            if "Variance from" in clean_line and "Reserve" in clean_line and len(nums) >= 2:
-                res["minimumReserve_variance"] = nums[1]
-
-        res["beginningBalance_FY2526"] = td["Beginning Balance"]["fy2526"]
-        res["netRevenues_FY2526"] = td["Net Receipts"]["fy2526"]
-        res["appropriations_FY2526"] = td["Total Appropriations"]["fy2526"]
-        res["endingBalance_FY2526"] = td["Ending Balance"]["fy2526"]
-
-        table = [
-            {"label": "Beginning Balance", **td["Beginning Balance"]},
-            {"label": "Net Receipts", **td["Net Receipts"]},
-            {"label": "Total Appropriations", **td["Total Appropriations"]},
-            {"label": "Ending Balance", **td["Ending Balance"]}
-        ]
-
-        return {"status": res, "table": table}
     except Exception as e:
-        print(f"GF Status Error: {e}")
-        return {"status": {}, "table": []}
+        print(f"pdftotext failed on {pdf_path}: {e}")
+        return ""
 
 
-def parse_revenue_pdf(pdf_path, fallback_total):
-    import subprocess
-    import re
+def _extract_numbers(line):
+    """Extract integers; parenthesized values become negative."""
+    matches = re.findall(r'\(([\d,]{4,})\)|(-?[\d,]{4,})', line)
+    out = []
+    for neg, pos in matches:
+        if neg:
+            out.append(-int(neg.replace(",", "")))
+        elif pos:
+            out.append(int(pos.replace(",", "")))
+    return out
 
-    rev = {
-        "period": "Unknown", "ytdActual": 0, "ytdForecast": 0, 
-        "categories": [], "monthlySeries": [], "nefabForecasts": []
+
+# ---------------------------------------------------------------------------
+# GF Financial Status parser — REWRITTEN
+# ---------------------------------------------------------------------------
+
+def _isolate_gf_status_section(full_text):
+    """
+    Return the portion of the PDF text between the GF Status section header
+    and the Cash Reserve Fund section header. This is the critical step that
+    prevents the parser from mistakenly reading CRF rows.
+    """
+    start_idx = 0
+    for m in re.finditer(r"General Fund Financial Status", full_text):
+        # Require the match to be followed by actual table content, not a TOC entry
+        window = full_text[m.start():m.start() + 800]
+        if re.search(r"BEGINNING BALANCE|Appropriations Committee Recommendation", window):
+            start_idx = m.start()
+            break
+
+    section = full_text[start_idx:]
+    crf_match = re.search(r"\n\s*Cash Reserve Fund\s*\n", section)
+    if crf_match:
+        section = section[:crf_match.start()]
+
+    return section
+
+
+def parse_gf_status_pdf(pdf_paths):
+    """
+    Parse the General Fund Financial Status 5-year table.
+
+    Accepts a list of candidate PDFs. Tries each in order and returns the
+    first one that passes sanity checks. In practice we pass
+    [status.pdf, biennial_budget.pdf] — the standalone status.pdf if
+    available, falling back to the full biennial budget PDF which contains
+    the same table on page 4.
+    """
+    if isinstance(pdf_paths, str):
+        pdf_paths = [pdf_paths]
+    pdf_paths = [p for p in pdf_paths if p]
+
+    empty = {"status": {}, "table": []}
+    if not pdf_paths:
+        return empty
+
+    # These patterns ONLY match rows in the GF Financial Status table.
+    # None of them matches anything in the Cash Reserve Fund table.
+    row_patterns = {
+        "UnobligatedBeg":   r"Unobligated\s+Beginning\s+Balance",
+        "NetRevenues":      r"General\s+Fund\s+Net\s+Revenues",
+        "Appropriations":   r"General\s+Fund\s+Appropriations(?!\s+by|\s+Adjustment)",
+        "EndingBalance":    r"Ending\s+balance\s*\(per\s+Financial\s+Status\)",
+        "ReserveVariance":  r"Excess\s*\(shortfall\)\s*from\s+Minimum\s+Reserve",
     }
 
-    if pdf_path:
-        try:
-            text = subprocess.run(["pdftotext", "-layout", pdf_path, "-"], capture_output=True, text=True).stdout
-            
-            cat_map = {"Individual Income": r"Individual Income", "Sales and Use": r"Sales (and|&) Use", "Corporate Income": r"Corporate Income", "Miscellaneous": r"Miscellaneous"}
-            for cat_name, pattern in cat_map.items():
-                m = re.search(pattern + r'.*?([\d,]{6,}).*?([\d,]{6,})', text, re.IGNORECASE)
+    def empty_row():
+        return {"fy2425": 0, "fy2526": 0, "fy2627": 0, "fy2728": 0, "fy2829": 0}
+
+    for pdf_path in pdf_paths:
+        text = _pdf_to_text(pdf_path)
+        if not text:
+            continue
+
+        section = _isolate_gf_status_section(text)
+        if not section.strip():
+            continue
+
+        td = {k: empty_row() for k in row_patterns}
+        found_anything = False
+
+        for line in section.split("\n"):
+            clean = line.strip()
+            if not clean:
+                continue
+            for key, pattern in row_patterns.items():
+                if re.search(pattern, clean, re.IGNORECASE):
+                    nums = _extract_numbers(clean)
+                    if not nums:
+                        continue
+
+                    # Reserve Variance row is special: the PDF shows dashes
+                    # ("--") for FY24-25, FY25-26, and FY27-28 because the
+                    # variance is only calculated at the end of each biennium.
+                    # Two numbers on this row correspond to FY26-27 and FY28-29.
+                    if key == "ReserveVariance":
+                        row = {"fy2425": 0, "fy2526": 0, "fy2627": 0, "fy2728": 0, "fy2829": 0}
+                        if len(nums) >= 2:
+                            row["fy2627"] = nums[-2]
+                            row["fy2829"] = nums[-1]
+                        elif len(nums) == 1:
+                            row["fy2627"] = nums[0]
+                        td[key] = row
+                        found_anything = True
+                        break
+
+                    if len(nums) < 2:
+                        continue
+                    # Other rows have all 5 fiscal-year columns populated.
+                    # Take last 5 numbers; leading numbers like row indices
+                    # get discarded.
+                    fy_nums = nums[-5:]
+                    while len(fy_nums) < 5:
+                        fy_nums = [0] + fy_nums
+                    td[key] = dict(zip(
+                        ["fy2425", "fy2526", "fy2627", "fy2728", "fy2829"],
+                        fy_nums,
+                    ))
+                    found_anything = True
+                    break
+
+        if not found_anything:
+            continue
+
+        # Build the 4-row table the dashboard expects
+        table = [
+            {"label": "Beginning Balance", **td["UnobligatedBeg"]},
+            {"label": "Net Receipts", **td["NetRevenues"]},
+            {"label": "Total Appropriations", **td["Appropriations"]},
+            {"label": "Ending Balance", **td["EndingBalance"]},
+        ]
+
+        # Variance is reported in FY26/27 (biennial) and FY28/29 (following biennium)
+        variance_fy2627 = td["ReserveVariance"]["fy2627"]
+        variance_fy2829 = td["ReserveVariance"]["fy2829"]
+
+        status = {
+            "beginningBalance_FY2526": td["UnobligatedBeg"]["fy2526"],
+            "netRevenues_FY2526": td["NetRevenues"]["fy2526"],
+            "appropriations_FY2526": td["Appropriations"]["fy2526"],
+            "endingBalance_FY2526": td["EndingBalance"]["fy2526"],
+            "minimumReserve_variance": variance_fy2627,
+            "minimumReserve_variance_FY2829": variance_fy2829,
+        }
+
+        # SANITY CHECKS — fail loud if output looks like Cash Reserve data
+        warnings = []
+
+        # Known CRF values to reject against
+        if abs(status["beginningBalance_FY2526"] - 877_079_779) < 100_000:
+            warnings.append(
+                "beginningBalance_FY2526 matches Cash Reserve FY24-25 ending "
+                "— parser is reading the wrong table"
+            )
+        if abs(status["endingBalance_FY2526"] - 828_032_779) < 2_000_000:
+            warnings.append(
+                "endingBalance_FY2526 matches Cash Reserve FY25-26 ending "
+                "— parser is reading the wrong table"
+            )
+        if variance_fy2627 > 0:
+            warnings.append(
+                f"minimumReserve_variance is positive ({variance_fy2627:,}) "
+                "— Nebraska has been projected below minimum reserve in every "
+                "Committee recommendation since July 2025; positive variance "
+                "is almost certainly a misread"
+            )
+        if not (100_000_000 <= abs(status["endingBalance_FY2526"]) <= 900_000_000):
+            warnings.append(
+                f"endingBalance_FY2526 ({status['endingBalance_FY2526']:,}) "
+                "outside plausible range $100M–$900M"
+            )
+
+        if warnings:
+            print(f"⚠️  GF Status parser warnings for {os.path.basename(pdf_path)}:")
+            for w in warnings:
+                print(f"   - {w}")
+            # Try the next candidate PDF instead of returning bad data
+            continue
+
+        print(f"✅ GF Status parsed from {os.path.basename(pdf_path)}:")
+        print(f"   Beginning FY25-26: ${status['beginningBalance_FY2526']:>15,}")
+        print(f"   Net Revenues FY25-26: ${status['netRevenues_FY2526']:>15,}")
+        print(f"   Approp FY25-26:    ${status['appropriations_FY2526']:>15,}")
+        print(f"   Ending FY25-26:    ${status['endingBalance_FY2526']:>15,}")
+        print(f"   Reserve Variance FY26/27: ${variance_fy2627:>15,}")
+        return {"status": status, "table": table}
+
+    print("❌ GF Status parser failed sanity checks on all candidate PDFs")
+    return empty
+
+
+# ---------------------------------------------------------------------------
+# NEFAB Revenue Forecasts — parse Table 3 from the biennial budget PDF
+# ---------------------------------------------------------------------------
+
+def parse_nefab_forecasts(budget_pdf_path):
+    """
+    Parse Table 3 (General Fund Revenue Forecasts) from the biennial budget
+    PDF. Returns a list of four category dicts with FY25-26 and FY26-27
+    forecast amounts plus adjusted growth rates.
+    """
+    if not budget_pdf_path:
+        return []
+
+    text = _pdf_to_text(budget_pdf_path)
+    if not text:
+        return []
+
+    table3_match = re.search(
+        r"Table 3\s*[-–]?\s*General Fund Revenue Forecasts"
+        r"(.*?)(?=Table 4|Historical General Fund Revenues)",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not table3_match:
+        print("⚠️  Could not locate Table 3 in biennial budget PDF")
+        return []
+
+    section = table3_match.group(1)
+
+    categories = [
+        ("Sales & Use",       r"Sales\s+and\s+Use\s+Tax"),
+        ("Individual Income", r"Individual\s+Income\s+Tax"),
+        ("Corporate Income",  r"Corporate\s+Income\s+Tax"),
+        ("Miscellaneous",     r"Miscellaneous\s+receipts"),
+    ]
+
+    # The section contains each category row twice: once with dollar amounts,
+    # once with growth percentages. We match the dollar-amount row first, then
+    # the percentage row.
+    forecasts = []
+    for display_name, anchor_pattern in categories:
+        # Dollar-amount line: category name followed by 5 large numbers
+        dollar_match = re.search(
+            anchor_pattern + r"\s+([\d,]{7,}(?:\s+[\d,]{7,}){2,4})",
+            section,
+            re.IGNORECASE,
+        )
+        if not dollar_match:
+            continue
+
+        nums = _extract_numbers(dollar_match.group(1))
+        if len(nums) < 3:
+            continue
+
+        # Columns: FY24-25 actual, FY25-26, FY26-27, FY27-28, FY28-29
+        fy2526 = nums[1]
+        fy2627 = nums[2]
+
+        # Growth-rate line: category name followed by percent values.
+        # The row has five % columns: FY24-25 actual, FY25-26, FY26-27,
+        # FY27-28, FY28-29. We want the FY25-26 adjusted growth (the second
+        # percentage), which is what the dashboard shows for current year.
+        growth_match = re.search(
+            anchor_pattern + r"\s+-?\d+\.\d+%\s+(-?\d+\.\d+%)",
+            section,
+            re.IGNORECASE,
+        )
+        growth = growth_match.group(1) if growth_match else "N/A"
+
+        forecasts.append({
+            "name": display_name,
+            "fy2526": fy2526,
+            "fy2627": fy2627,
+            "growth": growth,
+        })
+
+    if forecasts:
+        print(f"✅ NEFAB Table 3 parsed: {len(forecasts)} categories")
+
+    return forecasts
+
+
+def parse_revenue_pdf(rev_pdf_path, budget_pdf_path, rev_period_str):
+    """
+    Assemble the revenue section of the dashboard JSON.
+
+    NEFAB forecasts always come from the biennial budget PDF (Table 3) because
+    those are the authoritative numbers that the dashboard compares against.
+    YTD actuals come from the monthly revenue release PDF if available.
+
+    IMPORTANT: the old behavior fabricated pro-rata "forecasts" when the
+    revenue release fetch failed. That produced identical split percentages
+    across all categories, which was mathematically impossible. We now leave
+    arrays empty rather than ship fake data — the dashboard handles missing
+    revenue data gracefully.
+    """
+    rev = {
+        "period": rev_period_str,
+        "ytdActual": 0,
+        "ytdForecast": 0,
+        "categories": [],
+        "monthlySeries": [],
+        "nefabForecasts": [],
+    }
+
+    rev["nefabForecasts"] = parse_nefab_forecasts(budget_pdf_path)
+
+    if rev_pdf_path:
+        text = _pdf_to_text(rev_pdf_path)
+        if text:
+            # YTD totals
+            tot_m = re.search(
+                r"Total\s+Net\s+Receipts[^\n]*?([\d,]{9,})\s+([\d,]{9,})",
+                text,
+                re.IGNORECASE,
+            )
+            if tot_m:
+                rev["ytdActual"] = int(tot_m.group(1).replace(",", ""))
+                rev["ytdForecast"] = int(tot_m.group(2).replace(",", ""))
+
+            # Category YTD actuals
+            cat_map = [
+                ("Sales & Use",       r"Sales\s+(?:and|&)\s+Use\s+Tax"),
+                ("Individual Income", r"Individual\s+Income\s+Tax"),
+                ("Corporate Income",  r"Corporate\s+Income\s+Tax"),
+                ("Miscellaneous",     r"Miscellaneous"),
+            ]
+            for name, pattern in cat_map:
+                m = re.search(
+                    pattern + r"[^\n]*?([\d,]{7,})\s+([\d,]{7,})",
+                    text,
+                    re.IGNORECASE,
+                )
                 if m:
-                    act = int(m.group(1).replace(',', ''))
-                    forc = int(m.group(2).replace(',', ''))
-                    rev["categories"].append({"name": cat_name, "actual": act, "forecast": forc})
-
-            tot = re.search(r'Total Net Receipts.*?([\d,]{7,}).*?([\d,]{7,})', text, re.IGNORECASE)
-            if tot:
-                rev["ytdActual"] = int(tot.group(1).replace(',', ''))
-                rev["ytdForecast"] = int(tot.group(2).replace(',', ''))
-        except Exception:
-            pass
-
-    if rev["ytdActual"] == 0 and fallback_total > 0:
-        rev["ytdActual"] = fallback_total
-        rev["ytdForecast"] = int(fallback_total * 0.98)
-        
-        rev["categories"] = [
-            {"name": "Sales & Use", "actual": int(fallback_total * 0.45), "forecast": int(fallback_total * 0.44)},
-            {"name": "Individual Income", "actual": int(fallback_total * 0.40), "forecast": int(fallback_total * 0.39)},
-            {"name": "Corporate", "actual": int(fallback_total * 0.10), "forecast": int(fallback_total * 0.10)},
-            {"name": "Miscellaneous", "actual": int(fallback_total * 0.05), "forecast": int(fallback_total * 0.05)},
-        ]
-        
-        months = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun"]
-        dist = [0.08, 0.08, 0.10, 0.09, 0.08, 0.12, 0.11, 0.07, 0.10, 0.09, 0.04, 0.04]
-        
-        current_month = datetime.datetime.now().month
-        passed = current_month - 6 if current_month >= 7 else current_month + 6
-        passed = max(1, min(12, passed))
-
-        for i in range(passed):
-            m_act = int(fallback_total * dist[i])
-            m_forc = int(m_act * 0.98)
-            rev["monthlySeries"].append({"month": months[i], "actual": m_act, "forecast": m_forc})
-
-        rev["nefabForecasts"] = [
-            {"name": "Sales & Use", "fy2526": int(fallback_total * 0.44), "fy2627": int(fallback_total * 0.46), "growth": "4.5%"},
-            {"name": "Individual Income", "fy2526": int(fallback_total * 0.39), "fy2627": int(fallback_total * 0.40), "growth": "2.5%"},
-            {"name": "Corporate", "fy2526": int(fallback_total * 0.10), "fy2627": int(fallback_total * 0.10), "growth": "0.0%"},
-            {"name": "Miscellaneous", "fy2526": int(fallback_total * 0.05), "fy2627": int(fallback_total * 0.05), "growth": "0.0%"}
-        ]
+                    rev["categories"].append({
+                        "name": name,
+                        "actual": int(m.group(1).replace(",", "")),
+                        "forecast": int(m.group(2).replace(",", "")),
+                    })
 
     return rev
 
 
-def parse_biennial_budget_agencies(pdf_path):
-    import subprocess
-    import re
+# ---------------------------------------------------------------------------
+# Agency parser — anchored to Table 12 "Total" rows
+# ---------------------------------------------------------------------------
 
+def parse_biennial_budget_agencies(pdf_path):
+    """
+    Parse Table 12 (General Fund Appropriation Adjustments by Agency).
+
+    Row format in the PDF:
+       #25  DHHS  Total  2,023,307,450  2,051,562,444  (14,058,698)  ...
+
+    We take the first number after "Total" as the Enacted FY2025-26
+    appropriation. Cash fund totals come from the "Cash Funds" subsection of
+    the "All Fund Appropriations" section.
+    """
     if not pdf_path:
         return []
 
-    try:
-        text = subprocess.run(
-            ["pdftotext", "-layout", pdf_path, "-"],
-            capture_output=True,
-            text=True,
-        ).stdout
-
-        agencies = {}
-        current_fund = "TOT"  # Default bucket
-        
-        # Matches agency rows, intentionally ignoring the "Total" row to prevent double counting
-        # Example match: "  25 Health & Human Services    Oper    1,000,000"
-        pattern = re.compile(
-            r"^\s*#?(\d{2,3})\s+([A-Za-z\s&,./\-]+?)\s+(Oper|Aid|Const)\s+([\d,()]+)",
-            re.M,
-        )
-
-        # Process the document page-by-page
-        for page in text.split('\f'):
-            # Look only at the top 500 characters of the page to find the true table header
-            header = page[:500].lower()
-            
-            if "general fund" in header and ("appropriation" in header or "aid" in header or "agency" in header):
-                current_fund = "GF"
-            elif "cash fund" in header and ("appropriation" in header or "aid" in header or "agency" in header):
-                current_fund = "CF"
-            elif "federal fund" in header:
-                current_fund = "FF"
-            elif "revolving fund" in header:
-                current_fund = "RF"
-            elif "total" in header and "all fund" in header:
-                current_fund = "TOT"
-
-            # Parse all agencies on this specific page
-            for match in pattern.finditer(page):
-                aid = match.group(1)
-                name = match.group(2).strip()
-                val_str = match.group(4).replace(",", "").replace("(", "-").replace(")", "")
-                val = int(val_str)
-                
-                if aid not in agencies:
-                    agencies[aid] = {"name": name, "gf": 0, "cf": 0}
-                
-                # Place the money in the correct bucket based on the page header
-                if current_fund == "GF":
-                    agencies[aid]["gf"] += val
-                elif current_fund == "CF":
-                    agencies[aid]["cf"] += val
-
-        final_agencies = []
-        for aid, data in agencies.items():
-            if data["gf"] > 0 or data["cf"] > 0:
-                final_agencies.append({
-                    "id": aid,
-                    "name": data["name"],
-                    "appropriation": data["gf"],
-                    "cash_fund": data["cf"]
-                })
-
-        # ==========================================
-        # THE INVINCIBLE FALLBACK
-        # If the page headers failed (meaning GF is $0), use safe Max-Value tracking
-        # ==========================================
-        gf_sum = sum(a["appropriation"] for a in final_agencies)
-        if gf_sum == 0:
-            agencies_fallback = {}
-            for match in pattern.finditer(text):
-                aid = match.group(1)
-                name = match.group(2).strip()
-                row_type = match.group(3)
-                val = int(match.group(4).replace(",", "").replace("(", "-").replace(")", ""))
-                
-                if aid not in agencies_fallback:
-                    agencies_fallback[aid] = {"name": name, "Oper": 0, "Aid": 0, "Const": 0}
-                
-                # Keep the absolute highest value seen across all tables for this specific row type.
-                # This completely eliminates double-counting while guaranteeing the actual budget amount.
-                agencies_fallback[aid][row_type] = max(agencies_fallback[aid][row_type], val)
-                
-            final_agencies = []
-            for aid, d in agencies_fallback.items():
-                gf_approx = d["Oper"] + d["Aid"] + d["Const"]
-                if gf_approx > 0:
-                    final_agencies.append({
-                        "id": aid, 
-                        "name": d["name"], 
-                        "appropriation": gf_approx, 
-                        "cash_fund": 0
-                    })
-
-        return final_agencies
-    except Exception as e:
-        print(f"Agency Parse Error: {e}")
+    text = _pdf_to_text(pdf_path)
+    if not text:
         return []
 
+    agencies = {}
+
+    # Table 12 section for GF
+    t12 = re.search(
+        r"Table 12.*?General Fund Appropriation Adjustments by Agency"
+        r"(.*?)(?=All Fund Appropriations|CAPITAL CONSTRUCTION|\Z)",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    gf_section = t12.group(1) if t12 else text
+
+    total_row = re.compile(
+        r"^\s*#?(\d{2,3})\s+([A-Za-z][A-Za-z\s&,./\-']+?)\s+Total\s+([\d,()\s\-]+)$",
+        re.MULTILINE,
+    )
+
+    for m in total_row.finditer(gf_section):
+        aid = m.group(1)
+        name = m.group(2).strip()
+        nums = _extract_numbers(m.group(3))
+        if not nums:
+            continue
+        gf_val = nums[0]  # first column = Enacted FY2025-26
+        if gf_val <= 0:
+            continue
+        if aid not in agencies:
+            agencies[aid] = {"name": name, "gf": gf_val, "cf": 0}
+        else:
+            agencies[aid]["gf"] = max(agencies[aid]["gf"], gf_val)
+
+    # Cash Fund subsection
+    cf_match = re.search(
+        r"All Fund Appropriations.*?Cash Funds"
+        r"(.*?)(?=Federal Funds|Revolving Funds|\Z)",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if cf_match:
+        for m in total_row.finditer(cf_match.group(1)):
+            aid = m.group(1)
+            name = m.group(2).strip()
+            nums = _extract_numbers(m.group(3))
+            if not nums or nums[0] <= 0:
+                continue
+            if aid not in agencies:
+                agencies[aid] = {"name": name, "gf": 0, "cf": nums[0]}
+            else:
+                agencies[aid]["cf"] = max(agencies[aid]["cf"], nums[0])
+
+    # Loose fallback — only used if Table 12 anchor completely failed
+    if not agencies:
+        print("⚠️  Agency parser: Table 12 anchor failed, using loose fallback")
+        loose = re.compile(
+            r"^\s*#?(\d{2,3})\s+([A-Za-z\s&,./\-']+?)\s+(Oper|Aid|Const|Total)\s+([\d,()]+)",
+            re.MULTILINE,
+        )
+        max_by_type = {}
+        names = {}
+        for m in loose.finditer(text):
+            aid = m.group(1)
+            name = m.group(2).strip()
+            rtype = m.group(3)
+            nums = _extract_numbers(m.group(4))
+            if not nums or nums[0] <= 0:
+                continue
+            key = (aid, rtype)
+            if key not in max_by_type or nums[0] > max_by_type[key]:
+                max_by_type[key] = nums[0]
+                names[aid] = name
+
+        for (aid, rtype), val in max_by_type.items():
+            if aid not in agencies:
+                agencies[aid] = {"name": names[aid], "gf": 0, "cf": 0}
+            if rtype in ("Oper", "Aid", "Const"):
+                agencies[aid]["gf"] += val
+
+    result = []
+    for aid, data in agencies.items():
+        if data["gf"] > 0 or data["cf"] > 0:
+            result.append({
+                "id": aid,
+                "name": data["name"],
+                "appropriation": data["gf"],
+                "cash_fund": data["cf"],
+            })
+
+    # Sanity: top 3 agencies by GF should be DHHS (#25), Education (#13),
+    # University (#51) in that order
+    top3 = sorted(result, key=lambda a: a["appropriation"], reverse=True)[:3]
+    top3_ids = [a["id"] for a in top3]
+    if top3_ids != ["25", "13", "51"]:
+        print(f"⚠️  Agency parser: top 3 by GF are {top3_ids}, expected ['25', '13', '51']")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# LFO Directory parser (unchanged — works correctly)
+# ---------------------------------------------------------------------------
 
 def parse_lfo_directory(pdf_paths):
-    import subprocess
-    import re
-
-    # Provide robust defaults for the major funds
     descriptions = {
         "10000": {
-            "title": "General Fund", 
-            "description": "The primary operating fund of the State.", 
+            "title": "General Fund",
+            "description": "The primary operating fund of the State.",
             "statutory_authority": "Neb. Rev. Stat. §77-2715",
             "agency_name": "Multiple Agencies",
-            "program": "Multiple Programs"
+            "program": "Multiple Programs",
         },
         "11000": {
-            "title": "Cash Reserve Fund", 
-            "description": "The State's 'Rainy Day' Fund.", 
+            "title": "Cash Reserve Fund",
+            "description": "The State's 'Rainy Day' Fund.",
             "statutory_authority": "Neb. Rev. Stat. §84-612",
             "agency_name": "State Treasurer",
-            "program": "N/A"
-        }
+            "program": "N/A",
+        },
     }
 
     if not pdf_paths:
         return descriptions
 
     for path in pdf_paths:
-        try:
-            text = subprocess.run(
-                ["pdftotext", "-layout", path, "-"],
-                capture_output=True,
-                text=True,
-            ).stdout
-
-            for page in text.split("\f"):
-                # Highly forgiving regex: catches "FUND 21351:", "FUND 21351 -", or "FUND: 21351"
-                fund_m = re.search(r"FUND\s*:?\s*(\d{5})[\s\:\-]+([^\n]+)", page, re.IGNORECASE)
-                
-                if fund_m:
-                    fid = fund_m.group(1)
-                    title = fund_m.group(2).strip()
-                    
-                    # Extract Description and Statute
-                    desc_m = re.search(r"PERMITTED USES\s*:?\s*(.+?)(?=\n\s*FUND SUMMARY|\n\s*REVENUE|\Z)", page, re.S | re.IGNORECASE)
-                    stat_m = re.search(r"STATUTORY AUTHORITY\s*:?\s*(.+?)(?=\n\s*REVENUE|\n\s*PERMITTED|\Z)", page, re.S | re.IGNORECASE)
-                    
-                    # Extract Agency and Program (ignores the numeric ID and grabs the text name)
-                    agency_m = re.search(r"AGENCY\s*:?\s*(?:#?\d+)?[\s\-\:]*([^\n]+)", page, re.IGNORECASE)
-                    prog_m = re.search(r"PROGRAM\s*:?\s*(?:#?\d+)?[\s\-\:]*([^\n]+)", page, re.IGNORECASE)
-
-                    if fid not in ["10000", "11000"]:
-                        desc_text = re.sub(r"\s+", " ", desc_m.group(1)).strip() if desc_m else ""
-                        stat_text = re.sub(r"\s+", " ", stat_m.group(1)).strip() if stat_m else ""
-                        agency_text = agency_m.group(1).strip() if agency_m else ""
-                        prog_text = prog_m.group(1).strip() if prog_m else ""
-                        
-                        # Preserve existing data if a newer PDF happens to have a blank page for this fund
-                        existing = descriptions.get(fid, {})
-                        
-                        descriptions[fid] = {
-                            "title": title if title else existing.get("title", ""),
-                            "description": desc_text if desc_text else existing.get("description", ""),
-                            "statutory_authority": stat_text if stat_text else existing.get("statutory_authority", ""),
-                            "agency_name": agency_text if agency_text else existing.get("agency_name", ""),
-                            "program": prog_text if prog_text else existing.get("program", "")
-                        }
-        except Exception as e:
-            print(f"LFO Parse Error: {e}")
+        text = _pdf_to_text(path)
+        if not text:
             continue
+
+        for page in text.split("\f"):
+            fund_m = re.search(r"FUND\s*:?\s*(\d{5})[\s\:\-]+([^\n]+)", page, re.IGNORECASE)
+            if not fund_m:
+                continue
+
+            fid = fund_m.group(1)
+            if fid in ("10000", "11000"):
+                continue
+
+            title = fund_m.group(2).strip()
+            desc_m = re.search(
+                r"PERMITTED USES\s*:?\s*(.+?)(?=\n\s*FUND SUMMARY|\n\s*REVENUE|\Z)",
+                page, re.S | re.IGNORECASE,
+            )
+            stat_m = re.search(
+                r"STATUTORY AUTHORITY\s*:?\s*(.+?)(?=\n\s*REVENUE|\n\s*PERMITTED|\Z)",
+                page, re.S | re.IGNORECASE,
+            )
+            agency_m = re.search(
+                r"AGENCY\s*:?\s*(?:#?\d+)?[\s\-\:]*([^\n]+)",
+                page, re.IGNORECASE,
+            )
+            prog_m = re.search(
+                r"PROGRAM\s*:?\s*(?:#?\d+)?[\s\-\:]*([^\n]+)",
+                page, re.IGNORECASE,
+            )
+
+            desc_text = re.sub(r"\s+", " ", desc_m.group(1)).strip() if desc_m else ""
+            stat_text = re.sub(r"\s+", " ", stat_m.group(1)).strip() if stat_m else ""
+            agency_text = agency_m.group(1).strip() if agency_m else ""
+            prog_text = prog_m.group(1).strip() if prog_m else ""
+
+            existing = descriptions.get(fid, {})
+            descriptions[fid] = {
+                "title": title or existing.get("title", ""),
+                "description": desc_text or existing.get("description", ""),
+                "statutory_authority": stat_text or existing.get("statutory_authority", ""),
+                "agency_name": agency_text or existing.get("agency_name", ""),
+                "program": prog_text or existing.get("program", ""),
+            }
 
     return descriptions
 
+
+# ---------------------------------------------------------------------------
+# Sheet upload (unchanged)
+# ---------------------------------------------------------------------------
 
 def push_to_sheet(data, sheet_id, sheet_name="Sheet1", credentials_path="credentials.json"):
     output_path = "dashboard_data.json"
@@ -531,6 +809,10 @@ def push_to_sheet(data, sheet_id, sheet_name="Sheet1", credentials_path="credent
         raise RuntimeError(f"Unexpected error pushing to Google Sheets: {e}") from e
 
 
+# ---------------------------------------------------------------------------
+# main()
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sheet-id", required=True)
@@ -550,13 +832,24 @@ def main():
 
     status_path = fetch_gf_status(work_dir)
     budget_path = fetch_biennial_budget(budget_year, work_dir)
+    # Try the other budget year as fallback in case of off-cycle publication
+    alt_budget_path = None
+    if not budget_path:
+        alt_budget_path = fetch_biennial_budget(budget_year + 1, work_dir)
+    effective_budget = budget_path or alt_budget_path
+
     lfo_paths = fetch_lfo_directory(work_dir)
     rev_path, rev_period = fetch_revenue_release(work_dir)
 
     print("Step 3: Parsing Data...")
     oip_data = parse_oip_for_dashboard(oip_path) if oip_path else {"funds": [], "macro": {}}
-    gf_data = parse_gf_status_pdf(status_path)
-    agency_data = parse_biennial_budget_agencies(budget_path)
+
+    # Pass both candidates to the GF Status parser — the standalone status.pdf
+    # is preferred, but if it fails sanity checks the full biennial budget PDF
+    # contains the same table and will be tried next.
+    gf_data = parse_gf_status_pdf([status_path, effective_budget])
+
+    agency_data = parse_biennial_budget_agencies(effective_budget)
     lfo_data = parse_lfo_directory(lfo_paths)
 
     status_dict = gf_data.get("status", {})
@@ -565,9 +858,7 @@ def main():
     if cr_fund:
         status_dict["cashReserve_endingBalance"] = cr_fund["balance"]
 
-    revenue_data = parse_revenue_pdf(rev_path, status_dict.get("netRevenues_FY2526", 0))
-    if revenue_data["period"] == "Unknown":
-        revenue_data["period"] = rev_period
+    revenue_data = parse_revenue_pdf(rev_path, effective_budget, rev_period)
 
     dashboard = {
         "lastUpdated": {
