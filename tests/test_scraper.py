@@ -65,7 +65,7 @@ FY2024-25 FY2025-26 FY2026-27 FY2027-28 FY2028-29
 18 General Fund Net Revenues 4,462,629,700 5,012,261,589 5,330,135,495 5,028,339,930 5,343,102,103
 21 General Fund Appropriations 5,474,665,244 5,506,214,791 5,314,622,599 5,445,676,845 5,577,802,362
 23 $ Ending Balance 792,515,104 298,561,902 115,761,354 (301,575,561) (541,275,820)
-25 Excess (shortfall) from Minimum Reserve -- (208,556,477) -- (846,728,346) --
+25 Excess (shortfall) from Minimum Reserve -- (208,556,477) -- (846,728,346)
 6 Projected Unobligated Ending Balance 877,079,779 829,532,779 526,032,779 476,032,779 426,032,779
 '''
         result = scraper.parse_gf_status_text(text, date(2026, 8, 14))
@@ -91,6 +91,28 @@ The estimates use the February 27, 2026 NEFAB forecast.
         self.assertEqual(result['ytdForecast'], 373_657_000)
         self.assertEqual(result['categories'][0]['actual'], 256_910_556)
 
+    def test_revenue_parser_selects_projected_table_before_prior_year_table(self):
+        text = '''
+The forecast made by the Nebraska Economic Forecasting Advisory Board on February 27, 2026.
+\fComparison of Actual and Projected General Fund Receipts
+July Actual July Projected Difference Cumulative Actual Cumulative Projected Difference
+Net Receipts:
+Sales & Use Tax 256,910,556 231,325,000 25,585,556 256,910,556 231,325,000 25,585,556
+Ind Income Tax 84,104,984 101,764,000 (17,659,016) 84,104,984 101,764,000 (17,659,016)
+Corp Income Tax 13,063,554 21,963,000 (8,899,446) 13,063,554 21,963,000 (8,899,446)
+Misc Taxes 19,175,941 18,605,000 570,941 19,175,941 18,605,000 570,941
+Total Net 373,255,035 373,657,000 (401,965) 373,255,035 373,657,000 (401,965)
+\fComparison: Current Year - Previous Year
+Net Receipts:
+Sales & Use Tax 289,528,212 256,910,556 (32,617,656) 289,528,212 256,910,556 (32,617,656)
+Total Net Receipts 430,750,750 373,255,035 (57,495,714) 430,750,750 373,255,035 (57,495,714)
+'''
+        result = scraper.parse_revenue_text(text, 'July 2026')
+        self.assertEqual(result['ytdActual'], 373_255_035)
+        self.assertEqual(result['ytdForecast'], 373_657_000)
+        self.assertEqual(result['monthlySeries'][0]['actual'], 373_255_035)
+        self.assertEqual(result['nefabBasis'], 'February 27, 2026')
+
     def test_agencies_include_all_fund_types(self):
         rows = ''.join(
             f'<tr><td>Agency {i}</td><td>$1,000,000</td><td>$200,000</td><td>$10,000</td>'
@@ -101,6 +123,26 @@ The estimates use the February 27, 2026 NEFAB forecast.
         <th>Cash</th><th>Construction</th><th>Federal</th><th>Revolving</th><th>Total</th></tr>{rows}</table>'''
         agencies, fiscal_year = scraper.parse_agency_budget_html(html)
         self.assertEqual(fiscal_year, 'FY2026-27')
+        self.assertEqual(agencies[0]['all_funds'], 1_760_000)
+        self.assertEqual(agencies[0]['federal_fund'], 500_000)
+
+    def test_agencies_parse_current_state_spending_span_layout(self):
+        rows = ''.join(
+            f'''<div class="rowWrap">
+            <span id="AgencyLabel_{i}">Agency {i}</span>
+            <span id="GeneralLabel_{i}">$1,000,000</span>
+            <span id="CashLabel_{i}">$200,000</span>
+            <span id="ConstructionLabel_{i}">$10,000</span>
+            <span id="FederalLabel_{i}">$500,000</span>
+            <span id="RevolvingLabel_{i}">$50,000</span>
+            <span id="TotalLabel_{i}">$1,760,000</span>
+            </div>'''
+            for i in range(1, 13)
+        )
+        html = f'<h2>2026-2027 State Budget, fiscal year July 1, 2026</h2>{rows}'
+        agencies, fiscal_year = scraper.parse_agency_budget_html(html)
+        self.assertEqual(fiscal_year, 'FY2026-27')
+        self.assertEqual(len(agencies), 12)
         self.assertEqual(agencies[0]['all_funds'], 1_760_000)
         self.assertEqual(agencies[0]['federal_fund'], 500_000)
 
