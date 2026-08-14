@@ -57,6 +57,23 @@ Excess / (Shortfall) 0 0 6,251,270 0 (631,919,511)
         self.assertEqual(result['status']['minimumReserveVariance'], 6_251_270)
         self.assertEqual(result['status']['followingBienniumVariance'], -631_919_511)
 
+    def test_gf_status_parses_numbered_current_status_rows_and_dash_cells(self):
+        text = '''
+General Fund Financial Status
+FY2024-25 FY2025-26 FY2026-27 FY2027-28 FY2028-29
+7 Unobligated Beginning Balance 1,804,550,647 792,515,104 100,248,458 115,761,354 (306,575,561)
+18 General Fund Net Revenues 4,462,629,700 5,012,261,589 5,330,135,495 5,028,339,930 5,343,102,103
+21 General Fund Appropriations 5,474,665,244 5,506,214,791 5,314,622,599 5,445,676,845 5,577,802,362
+23 $ Ending Balance 792,515,104 298,561,902 115,761,354 (301,575,561) (541,275,820)
+25 Excess (shortfall) from Minimum Reserve -- (208,556,477) -- (846,728,346) --
+6 Projected Unobligated Ending Balance 877,079,779 829,532,779 526,032,779 476,032,779 426,032,779
+'''
+        result = scraper.parse_gf_status_text(text, date(2026, 8, 14))
+        self.assertEqual(result['status']['fiscalYear'], 'FY2026-27')
+        self.assertEqual(result['status']['minimumReserveVariance'], -208_556_477)
+        self.assertEqual(result['status']['followingBienniumVariance'], -846_728_346)
+        self.assertEqual(result['status']['cashReserveProjectedEndingBalance'], 526_032_779)
+
     def test_revenue_parser_uses_net_cumulative_columns(self):
         text = '''
 Gross Receipts
