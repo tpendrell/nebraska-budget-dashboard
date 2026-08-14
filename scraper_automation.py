@@ -28,6 +28,7 @@ from openpyxl import load_workbook
 
 DAS_REPORTS_URL = "https://das.nebraska.gov/accounting/financial_reports.php"
 LEGISLATURE_REPORTS_URL = "https://nebraskalegislature.gov/reports/fiscal.php"
+CURRENT_GF_STATUS_URL = "https://nebraskalegislature.gov/FloorDocs/Current/PDF/Budget/status.pdf"
 REVENUE_REPORTS_URL = (
     "https://revenue.nebraska.gov/about/news-releases/"
     "general-fund-receipts-news-releases"
@@ -208,14 +209,18 @@ def _amounts(line: str) -> list[int]:
 
 
 def _row_amounts(line: str) -> list[int]:
-    """Extract table values, including literal zero cells but excluding percentages."""
-    return [
-        round(_number(match.group(0)))
-        for match in re.finditer(r"(?<![\w.])\(?-?\$?\d[\d,]*(?:\.\d+)?\)?(?![%\w.])", line)
-    ]
+    """Extract table cells, preserving published dash placeholders as zeroes."""
+    values = []
+    pattern = r"(?<![\w.])(?:--+|—+|\(?-?\$?\d[\d,]*(?:\.\d+)?\)?)(?![%\w.])"
+    for match in re.finditer(pattern, line):
+        token = match.group(0)
+        values.append(0 if re.fullmatch(r"--+|—+", token) else round(_number(token)))
+    return values
 
 
-def _pdf_to_text(path: Path) -> str:
+def _pdf_to_text(path: Path | None) -> str:
+    if path is None:
+        raise SourceError("No PDF source was discovered")
     try:
         result = subprocess.run(
             ["pdftotext", "-layout", str(path), "-"],
@@ -429,8 +434,11 @@ def discover_legislature_documents(links: Iterable[Link]) -> dict:
 
 
 def _find_table_row(text: str, label_pattern: str, minimum_values: int = 4) -> list[int]:
-    for match in re.finditer(rf"^\s*{label_pattern}[^\n]*$", text, re.I | re.M):
-        values = _row_amounts(match.group(0))
+    for line in text.splitlines():
+        label = re.search(label_pattern, line, re.I)
+        if not label:
+            continue
+        values = _row_amounts(line[label.end():])
         if len(values) >= minimum_values:
             return values
     return []
@@ -465,6 +473,19 @@ def parse_gf_status_text(text: str, as_of: date | None = None) -> dict:
             if values:
                 rows.append({"label": label, "values": dict(zip(found_years, values[:len(found_years)]))})
         if len(rows) >= 4:
+            # The official one-page status centers biennium-only reserve cells
+            # between two fiscal-year columns. pdftotext places those values in
+            # the first column of each pair; move them to the biennium-ending
+            # year used by the dashboard.
+            for item in rows:
+                if item["label"] not in {"Minimum Reserve at 3%", "Excess / (Shortfall)"}:
+                    continue
+                for index in range(2, len(found_years), 2):
+                    prior_year = found_years[index - 1]
+                    ending_year = found_years[index]
+                    if item["values"].get(ending_year, 0) == 0 and item["values"].get(prior_year, 0) != 0:
+                        item["values"][ending_year] = item["values"][prior_year]
+                        item["values"][prior_year] = 0
             selected = rows
             years = found_years
             break
@@ -501,6 +522,14 @@ def parse_gf_status_text(text: str, as_of: date | None = None) -> dict:
             projected_reserve *= 1_000_000
         elif (reserve_match.group(2) or "").lower() == "billion":
             projected_reserve *= 1_000_000_000
+    if not projected_reserve:
+        reserve_values = _find_table_row(
+            text,
+            r"Projected\s+Unobligated\s+Ending\s+Balance",
+            len(years),
+        )
+        if reserve_values:
+            projected_reserve = reserve_values[years.index(current_fy)]
     status = {
         "fiscalYear": current_fy,
         "beginningBalance": row("Unobligated Beginning Balance").get(current_fy, 0),
@@ -774,6 +803,10 @@ def build_dashboard(output: Path, target: date | None = None) -> dict:
     directory_paths: list[Path] = []
     try:
         _, legislature_links = official_links(LEGISLATURE_REPORTS_URL)
+        legislature_links = [
+            Link(CURRENT_GF_STATUS_URL, "Current General Fund Status"),
+            *legislature_links,
+        ]
         documents = discover_legislature_documents(legislature_links)
         if documents["status"]:
             status_path = download_document(documents["status"].url, work_dir / "gf-status.pdf", "pdf")
