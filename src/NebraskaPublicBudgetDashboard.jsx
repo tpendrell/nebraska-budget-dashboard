@@ -37,6 +37,7 @@ const TABS = [
 
 const NE_POP_FALLBACK = 2018006;
 const DATA_URL = `${import.meta.env.BASE_URL}dashboard_data.json`;
+const LEGACY_DATA_URL = 'https://script.google.com/macros/s/AKfycbxdhapah1CYnlo6GBH3vpstAxJx8JRzxenkDc45t_4qa5W306HY1m_Ft841nwHJs_x1/exec';
 
 /* ═══════════════════ FORMATTERS ═══════════════════ */
 
@@ -578,15 +579,34 @@ export default function NebraskaBudgetDashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [rawShape, setRawShape] = useState(null);
+  const [dataSource, setDataSource] = useState(null);
 
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const url = `${DATA_URL}?t=${Date.now()}`;
-        const response = await fetch(url, { cache: 'no-store' });
-        if (!response.ok) throw new Error(`Fetch failed: HTTP ${response.status}`);
+        const sources = [
+          { id: 'repository', url: DATA_URL },
+          { id: 'legacy', url: LEGACY_DATA_URL },
+        ];
+        const failures = [];
+        let raw = null;
+        let loadedFrom = null;
 
-        const raw = await response.json();
+        for (const source of sources) {
+          try {
+            const separator = source.url.includes('?') ? '&' : '?';
+            const response = await fetch(`${source.url}${separator}t=${Date.now()}`, { cache: 'no-store' });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            raw = await response.json();
+            if (!raw || !Array.isArray(raw.funds)) throw new Error('Invalid response shape');
+            loadedFrom = source.id;
+            break;
+          } catch (sourceError) {
+            failures.push(`${source.id}: ${sourceError.message || String(sourceError)}`);
+          }
+        }
+
+        if (!raw) throw new Error(`All data sources failed (${failures.join('; ')})`);
 
         const shape = {
           topLevelKeys: Object.keys(raw || {}),
@@ -599,6 +619,7 @@ export default function NebraskaBudgetDashboard() {
         };
         console.log('[Dashboard] Live data loaded:', shape);
         setRawShape(shape);
+        setDataSource(loadedFrom);
 
         setData(normalizeData(raw));
       } catch (err) {
@@ -665,7 +686,7 @@ export default function NebraskaBudgetDashboard() {
 
   const hasDescriptions = data.funds.some((f) => f.description);
   const hasGfStatus = data.gfStatusTable && data.gfStatusTable.length > 0;
-  const showDataWarning = !hasDescriptions || !hasGfStatus || data.warnings.length > 0;
+  const showDataWarning = dataSource === 'legacy' || !hasDescriptions || !hasGfStatus || data.warnings.length > 0;
 
   return (
     <div style={{ minHeight: '100vh', background: C.s50, color: C.s800, fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif' }}>
@@ -707,7 +728,8 @@ export default function NebraskaBudgetDashboard() {
             <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
               <AlertTriangle style={{ width: 18, height: 18, color: '#D97706', marginTop: 2, flexShrink: 0 }} />
               <div style={{ fontSize: 12.5, color: '#92400E', lineHeight: 1.7 }}>
-                <strong>Partial data loaded.</strong>{' '}
+                <strong>{dataSource === 'legacy' ? 'Fallback data feed in use.' : 'Partial data loaded.'}</strong>{' '}
+                {dataSource === 'legacy' && 'The repository snapshot is not available yet, so the dashboard is temporarily using its existing Google Apps Script feed. Dates shown in the header identify the reporting periods. '}
                 {!hasDescriptions && 'No fund descriptions from LFO Directory are available. '}
                 {!hasGfStatus && 'General Fund Status table is missing. '}
                 {data.warnings.length > 0 && data.warnings.join(' ')}
