@@ -35,10 +35,8 @@ const TABS = [
   { id: 'reference', icon: BookOpen, label: 'Reference' },
 ];
 
-const NE_POP = 1970000;
-
-// Your Google Apps Script URL
-const DATA_URL = 'https://script.google.com/macros/s/AKfycbxdhapah1CYnlo6GBH3vpstAxJx8JRzxenkDc45t_4qa5W306HY1m_Ft841nwHJs_x1/exec';
+const NE_POP_FALLBACK = 2018006;
+const DATA_URL = `${import.meta.env.BASE_URL}dashboard_data.json`;
 
 /* ═══════════════════ FORMATTERS ═══════════════════ */
 
@@ -104,7 +102,7 @@ function normalizeData(raw) {
       description: f.description || '', statutory_authority: f.statutory_authority || '',
       agency_name: f.agency_name || '', program: f.program || '',
       history: f.history || [], ending_balance: f.ending_balance ?? null,
-      category: getCat(id), dormant: false,
+      category: getCat(id), dormant: false, hasOipEntry: f.hasOipEntry !== false,
     });
   });
 
@@ -121,22 +119,15 @@ function normalizeData(raw) {
       if (!existing.program && desc.program) existing.program = desc.program;
       if (existing.ending_balance == null && desc.ending_balance != null) existing.ending_balance = desc.ending_balance;
     } else {
-      // Dormant-only fund — add with zero balance
+      // Directory-only record. Absence from OIP does not establish inactivity.
       seen.set(sId, {
         id: sId, title: desc.title || `Fund ${sId}`,
         balance: 0, interest: 0, delta: 0, approp: 0, expended: 0,
         description: desc.description || '', statutory_authority: desc.statutory_authority || '',
         agency_name: desc.agency_name || '', program: desc.program || '',
         history: [], ending_balance: desc.ending_balance ?? null,
-        category: getCat(sId), dormant: true,
+        category: getCat(sId), dormant: true, hasOipEntry: false,
       });
-    }
-  });
-
-  // Mark zero-balance active funds as dormant too (they're in OIP but have no money)
-  seen.forEach((f) => {
-    if (!f.dormant && f.balance === 0 && (f.approp || 0) === 0) {
-      f.dormant = true;
     }
   });
 
@@ -152,26 +143,35 @@ function normalizeData(raw) {
   };
 
   // Defensive defaults for GF Status and related structures
+  const oldStatus = safe.generalFundStatus || {};
   const generalFundStatus = {
-    beginningBalance_FY2526: 0, netRevenues_FY2526: 0,
-    appropriations_FY2526: 0, endingBalance_FY2526: 0,
-    minimumReserve_variance: 0, minimumReserve_variance_2829: 0,
-    cashReserve_endingBalance: 0, revenueGrowth_adjusted: '',
-    ...(safe.generalFundStatus || {}),
+    fiscalYear: oldStatus.fiscalYear || 'FY2025-26',
+    beginningBalance: Number(oldStatus.beginningBalance ?? oldStatus.beginningBalance_FY2526 ?? 0) || 0,
+    netRevenues: Number(oldStatus.netRevenues ?? oldStatus.netRevenues_FY2526 ?? 0) || 0,
+    appropriations: Number(oldStatus.appropriations ?? oldStatus.appropriations_FY2526 ?? 0) || 0,
+    endingBalance: Number(oldStatus.endingBalance ?? oldStatus.endingBalance_FY2526 ?? 0) || 0,
+    minimumReserveVariance: Number(oldStatus.minimumReserveVariance ?? oldStatus.minimumReserve_variance ?? 0) || 0,
+    followingBienniumVariance: Number(oldStatus.followingBienniumVariance ?? oldStatus.minimumReserve_variance_2829 ?? 0) || 0,
+    cashReserveProjectedEndingBalance: Number(oldStatus.cashReserveProjectedEndingBalance ?? 0) || 0,
+    cashReserveOipAverageDailyBalance: Number(oldStatus.cashReserveOipAverageDailyBalance ?? oldStatus.cashReserve_endingBalance ?? 0) || 0,
+    ...oldStatus,
   };
 
   return {
     ...safe, funds, revenue, generalFundStatus,
-    gfStatusTable: safe.gfStatusTable || [],
+    gfStatusTable: safe.gfStatusTable || [], gfStatusYears: safe.gfStatusYears || [],
     cashReserveHistory: safe.cashReserveHistory || [],
     transfersOutHistory: safe.transfersOutHistory || [],
     gfTransfers: safe.gfTransfers || [],
     agencies: safe.agencies || [],
-    lastUpdated: safe.lastUpdated || {},
+    lastUpdated: safe.lastUpdated || {}, sources: safe.sources || {}, warnings: safe.warnings || [],
+    population: safe.population || { value: NE_POP_FALLBACK, asOf: 'July 1, 2025 estimate' },
     macro: {
       totalBalance: safe.macro?.totalBalance || 0, totalInterest: safe.macro?.totalInterest || 0,
       effectiveYield: safe.macro?.effectiveYield || 'N/A', activeFunds: safe.macro?.activeFunds || 0,
-      dormantFunds: funds.filter((f) => f.dormant).length, totalFunds: funds.length,
+      dormantFunds: funds.filter((f) => f.dormant).length,
+      referenceOnlyFunds: funds.filter((f) => f.dormant).length,
+      totalFunds: funds.length,
     },
   };
 }
@@ -274,15 +274,15 @@ function OverviewTab({ data, onNav }) {
 
   return <div style={{ display: 'grid', gap: 18 }}>
     <Narrative>
-      Nebraska manages <strong>{fmtC(data.macro.totalBalance)}</strong> across {data.macro.totalFunds || 1502} state funds.
-      {gfs.endingBalance_FY2526 > 0 && <> The General Fund's ending balance is projected at {fmtC(gfs.endingBalance_FY2526)}{gfs.minimumReserve_variance < 0 && <> — <strong>{fmt(Math.abs(gfs.minimumReserve_variance))} below</strong> the constitutional minimum reserve</>}.</>}
+      The latest Operating Investment Pool report contains <strong>{fmtC(data.macro.totalBalance)}</strong> in average daily balances across {data.macro.reportedFunds || data.macro.activeFunds || data.funds.length} reported funds.
+      {gfs.endingBalance !== 0 && <> The official General Fund status projects a {gfs.endingBalance >= 0 ? 'positive' : 'negative'} {gfs.fiscalYear} ending balance of <strong>{fmtC(Math.abs(gfs.endingBalance))}</strong>.</>}
     </Narrative>
 
     <div style={{ ...card, background: `linear-gradient(135deg, ${C.navy}, ${C.navyMid}, ${C.navyLight})`, color: '#fff', padding: 26 }}>
-      <div style={{ fontSize: 11, color: C.goldLight, textTransform: 'uppercase', letterSpacing: 1.8 }}><InfoTip label="Statewide cash position" body="Weighted ADB across all state-managed OIP funds. Dormant LFO-only funds are in the Fund Explorer for reference." /></div>
+      <div style={{ fontSize: 11, color: C.goldLight, textTransform: 'uppercase', letterSpacing: 1.8 }}><InfoTip label="Statewide OIP position" body="Sum of average daily balances reported in the latest DAS Operating Investment Pool report. Directory-only records are shown separately for reference." /></div>
       <div style={{ fontSize: 42, fontWeight: 900, marginTop: 8 }}>{fmtC(data.macro.totalBalance)}</div>
       <div className="metric-grid" style={{ marginTop: 20 }}>
-        {[{ l: 'Pool interest', v: fmt(Math.abs(data.macro.totalInterest)) }, { l: 'Yield', v: data.macro.effectiveYield }, { l: 'Active', v: data.macro.activeFunds }, { l: 'Dormant', v: data.macro.dormantFunds }].map((s) => <div key={s.l}><div style={{ fontSize: 11, color: 'rgba(255,255,255,.6)', textTransform: 'uppercase', letterSpacing: 1.3 }}>{s.l}</div><div style={{ fontSize: 20, fontWeight: 800, marginTop: 3 }}>{s.v}</div></div>)}
+        {[{ l: 'Allocated interest', v: fmt(Math.abs(data.macro.totalInterest)) }, { l: 'Published rate', v: data.macro.effectiveYield }, { l: 'Nonzero balances', v: data.macro.activeFunds }, { l: 'Reference-only', v: data.macro.referenceOnlyFunds }].map((s) => <div key={s.l}><div style={{ fontSize: 11, color: 'rgba(255,255,255,.6)', textTransform: 'uppercase', letterSpacing: 1.3 }}>{s.l}</div><div style={{ fontSize: 20, fontWeight: 800, marginTop: 3 }}>{s.v}</div></div>)}
       </div>
     </div>
 
@@ -301,10 +301,10 @@ function OverviewTab({ data, onNav }) {
     </div>}
 
     <div className="metric-grid">
-      <MetricCard label="GF ending balance" value={fmtC(gfs.endingBalance_FY2526)} sub={<Delta value={gfs.endingBalance_FY2526 - gfs.beginningBalance_FY2526} compact />} />
-      <MetricCard label="Cash Reserve" value={fmtC(gfs.cashReserve_endingBalance)} />
-      <MetricCard label="Min reserve variance" value={fmtC(gfs.minimumReserve_variance)} sub={gfs.minimumReserve_variance < 0 ? <Badge text="Below target" color="#991B1B" bg="rgba(239,68,68,.12)" /> : null} />
-      <MetricCard label="GF net revenues" value={fmtC(gfs.netRevenues_FY2526)} />
+      <MetricCard label={`${gfs.fiscalYear} GF ending balance`} value={fmtC(gfs.endingBalance)} sub={<Delta value={gfs.endingBalance - gfs.beginningBalance} compact />} />
+      <MetricCard label="Cash Reserve OIP ADB" value={fmtC(gfs.cashReserveOipAverageDailyBalance)} />
+      <MetricCard label="Statutory reserve variance" value={fmtC(gfs.minimumReserveVariance)} sub={gfs.minimumReserveVariance < 0 ? <Badge text="Below target" color="#991B1B" bg="rgba(239,68,68,.12)" /> : <Badge text="Above target" color="#047857" bg="rgba(16,185,129,.12)" />} />
+      <MetricCard label={`${gfs.fiscalYear} GF net revenues`} value={fmtC(gfs.netRevenues)} />
     </div>
 
     <div className="three-col">{featured.map((f) => <button key={f.id} type="button" onClick={() => onNav('funds', f.id)} style={{ ...panel, textAlign: 'left', cursor: 'pointer', borderLeft: `4px solid ${f.delta >= 0 ? C.emerald : C.red}` }}>
@@ -314,8 +314,8 @@ function OverviewTab({ data, onNav }) {
       {f.approp > 0 && <div style={{ marginTop: 12 }}><PBar pct={f.expended / f.approp} color={C.navyLight} height={5} label={`${fmtP(f.expended / f.approp)} of ${fmtC(f.approp)} appropriated`} /></div>}
     </button>)}</div>
 
-    {data.macro.dormantFunds > 0 && <div style={{ ...panel, borderLeft: `4px solid ${C.amber}`, background: C.amberDim }}>
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><Ghost style={{ width: 18, height: 18, color: '#D97706', marginTop: 2, flexShrink: 0 }} /><div style={{ fontSize: 13, color: '#92400E', lineHeight: 1.7 }}><strong>{data.macro.dormantFunds} dormant funds</strong> hold zero balance. Senators may wish to review these for refunding or formal elimination. <button type="button" onClick={() => onNav('funds', null, true)} style={{ font: 'inherit', background: 'none', border: 'none', color: '#B45309', cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>View dormant funds →</button></div></div>
+    {data.macro.referenceOnlyFunds > 0 && <div style={{ ...panel, borderLeft: `4px solid ${C.amber}`, background: C.amberDim }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><FileText style={{ width: 18, height: 18, color: '#D97706', marginTop: 2, flexShrink: 0 }} /><div style={{ fontSize: 13, color: '#92400E', lineHeight: 1.7 }}><strong>{data.macro.referenceOnlyFunds} directory-only fund records</strong> do not have an entry in the latest OIP report. That does not establish that a fund is inactive, abolished, or eligible for transfer. <button type="button" onClick={() => onNav('funds', null, true)} style={{ font: 'inherit', background: 'none', border: 'none', color: '#B45309', cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>View reference-only records →</button></div></div>
     </div>}
   </div>;
 }
@@ -324,6 +324,7 @@ function OverviewTab({ data, onNav }) {
 
 function RevenueTab({ revenue }) {
   const v = revenue.ytdActual - revenue.ytdForecast;
+  const forecastYears = [...new Set(revenue.nefabForecasts.flatMap((row) => Object.keys(row.values || {})))];
   if (revenue.ytdActual === 0 && revenue.monthlySeries.length === 0) return <div style={panel}>No revenue data yet.</div>;
 
   return <div style={{ display: 'grid', gap: 18 }}>
@@ -374,13 +375,12 @@ function RevenueTab({ revenue }) {
     {revenue.nefabForecasts.length > 0 && <div style={panel}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
         <div><div style={{ fontWeight: 800, color: C.navy }}>NEFAB full-year forecasts</div></div>
-        <ExportBtn onClick={() => downloadCsv('ne_nefab_forecasts.csv', ['Category', 'FY25-26', 'FY26-27', 'Growth'], revenue.nefabForecasts.map((c) => [c.name, c.fy2526, c.fy2627, c.growth]))} />
+        <ExportBtn onClick={() => downloadCsv('ne_nefab_forecasts.csv', ['Category', ...forecastYears], revenue.nefabForecasts.map((c) => [c.name, ...forecastYears.map((fy) => c.values?.[fy])]))} />
       </div>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-        <thead><tr style={{ borderBottom: `2px solid ${C.s200}` }}>{['Category', 'FY25-26', 'FY26-27', 'Adj Growth'].map((h) => <th key={h} style={{ textAlign: h === 'Category' ? 'left' : 'right', padding: '8px 0', fontSize: 10, fontWeight: 700, color: C.s400, textTransform: 'uppercase', letterSpacing: 1 }}>{h}</th>)}</tr></thead>
+        <thead><tr style={{ borderBottom: `2px solid ${C.s200}` }}>{['Category', ...forecastYears].map((h) => <th key={h} style={{ textAlign: h === 'Category' ? 'left' : 'right', padding: '8px 0', fontSize: 10, fontWeight: 700, color: C.s400, textTransform: 'uppercase', letterSpacing: 1 }}>{h}</th>)}</tr></thead>
         <tbody>{revenue.nefabForecasts.map((c) => <tr key={c.name} style={{ borderBottom: `1px solid ${C.s100}` }}>
-          <td style={{ padding: '10px 0', fontWeight: 600 }}>{c.name}</td><td style={{ padding: '10px 0', textAlign: 'right' }}>{fmtC(c.fy2526)}</td><td style={{ padding: '10px 0', textAlign: 'right' }}>{fmtC(c.fy2627)}</td>
-          <td style={{ padding: '10px 0', textAlign: 'right', color: String(c.growth).startsWith('-') ? C.red : C.emerald, fontWeight: 600 }}>{c.growth}</td>
+          <td style={{ padding: '10px 0', fontWeight: 600 }}>{c.name}</td>{forecastYears.map((fy) => <td key={fy} style={{ padding: '10px 0', textAlign: 'right' }}>{fmtC(c.values?.[fy])}</td>)}
         </tr>)}</tbody>
       </table>
     </div>}
@@ -391,108 +391,79 @@ function RevenueTab({ revenue }) {
 
 function GFStatusTab({ data }) {
   const st = data.generalFundStatus || {};
-  const xfrs = data.gfTransfers || [];
   const table = data.gfStatusTable || [];
-  const crH = (data.cashReserveHistory || []).map((d) => ({ ...d, bal: (d.end || 0) / 1e6 }));
-  const xfrH = data.transfersOutHistory || [];
-  const fys = ['fy2425', 'fy2526', 'fy2627', 'fy2728', 'fy2829'];
-  const fyL = ['FY24-25 Actual', 'FY25-26', 'FY26-27', 'FY27-28 Est', 'FY28-29 Est'];
-
-  const endingRow = table.find((r) => String(r.label || '').includes('Ending'));
-  const transfersRow = table.find((r) => String(r.label || '').includes('Transfers'));
-  const fy2728End = endingRow?.fy2728;
+  const years = data.gfStatusYears?.length ? data.gfStatusYears : [...new Set(table.flatMap((row) => Object.keys(row.values || {})))];
+  const transfersRow = table.find((row) => String(row.label || '').includes('Transfers'));
+  const currentTransfers = transfersRow?.values?.[st.fiscalYear] || 0;
+  const reserveColor = st.minimumReserveVariance < 0 ? C.red : C.emerald;
+  const reserveBg = st.minimumReserveVariance < 0 ? C.redDim : C.emeraldDim;
 
   return <div style={{ display: 'grid', gap: 18 }}>
-    {fy2728End != null && <Narrative>
-      Nebraska's General Fund is projected to {fy2728End < 0 ? <>run a <strong>deficit of {fmt(Math.abs(fy2728End))}</strong></> : <>end with <strong>{fmt(fy2728End)}</strong></>} by FY2027-28.
-      {st.cashReserve_endingBalance > 0 && <> The state's rainy day fund is being drawn down to cover the gap.</>}
-    </Narrative>}
+    <Narrative>
+      This is the Legislature's latest official financial-status snapshot, not a live cash ledger. For {st.currentBienniumFiscalYear || 'the current biennium'}, the balance is projected to be <strong>{fmt(Math.abs(st.minimumReserveVariance))} {st.minimumReserveVariance < 0 ? 'below' : 'above'}</strong> the statutory 3% reserve level.
+      {st.followingBienniumFiscalYear && <> The projected variance for {st.followingBienniumFiscalYear} is <strong>{fmt(st.followingBienniumVariance)}</strong>.</>}
+    </Narrative>
 
-    {st.minimumReserve_variance < 0 && <div style={{ ...panel, borderLeft: `4px solid ${C.red}`, background: C.redDim }}>
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><AlertTriangle style={{ width: 18, height: 18, color: '#DC2626', marginTop: 2, flexShrink: 0 }} /><div style={{ fontSize: 13, color: '#7F1D1D', lineHeight: 1.7 }}>Current biennium: <strong>{fmt(Math.abs(st.minimumReserve_variance))} below</strong> the 3% minimum reserve.{st.minimumReserve_variance_2829 && st.minimumReserve_variance_2829 < 0 && <> Following biennium: <strong>{fmt(Math.abs(st.minimumReserve_variance_2829))} shortfall</strong> projected.</>}</div></div>
-    </div>}
+    <div style={{ ...panel, borderLeft: `4px solid ${reserveColor}`, background: reserveBg }}>
+      <div style={{ fontSize: 13, color: st.minimumReserveVariance < 0 ? '#7F1D1D' : '#065F46', lineHeight: 1.7 }}>
+        <strong>{st.currentBienniumFiscalYear || 'Current biennium'}:</strong> {fmt(Math.abs(st.minimumReserveVariance))} {st.minimumReserveVariance < 0 ? 'below' : 'above'} the statutory minimum reserve.
+      </div>
+    </div>
 
-    {(st.beginningBalance_FY2526 || st.netRevenues_FY2526 || st.endingBalance_FY2526) ? <div style={panel}>
-      <div style={{ fontWeight: 800, color: C.navy, marginBottom: 4 }}>FY2025-26 General Fund flow</div>
-      <div style={{ fontSize: 12, color: C.s500, marginBottom: 14 }}>How money moves through the General Fund this fiscal year</div>
-      <WaterfallChart
-        beginBal={st.beginningBalance_FY2526 || 0}
-        revenues={st.netRevenues_FY2526 || 0}
-        transfers={-Math.abs((transfersRow?.fy2526) || 0)}
-        appropriations={-Math.abs(st.appropriations_FY2526 || 0)}
-        endBal={st.endingBalance_FY2526 || 0}
-      />
+    {(st.beginningBalance || st.netRevenues || st.endingBalance) ? <div style={panel}>
+      <div style={{ fontWeight: 800, color: C.navy, marginBottom: 4 }}>{st.fiscalYear} General Fund flow</div>
+      <div style={{ fontSize: 12, color: C.s500, marginBottom: 14 }}>Official projected values from the latest General Fund Financial Status table</div>
+      <WaterfallChart beginBal={st.beginningBalance} revenues={st.netRevenues} transfers={-Math.abs(currentTransfers)} appropriations={-Math.abs(st.appropriations)} endBal={st.endingBalance} />
     </div> : null}
+
+    <div className="metric-grid">
+      <MetricCard label="Projected Cash Reserve ending" value={st.cashReserveProjectedEndingBalance ? fmtC(st.cashReserveProjectedEndingBalance) : 'Not parsed'} />
+      <MetricCard label="Cash Reserve monthly OIP ADB" value={fmtC(st.cashReserveOipAverageDailyBalance)} sub={<div style={{ fontSize: 11, color: C.s500 }}>A different measure; do not compare directly to projected ending balance.</div>} />
+    </div>
 
     {table.length > 0 && <div style={{ ...card, overflowX: 'auto' }}>
       <div style={{ padding: '14px 18px', fontWeight: 800, color: C.navy, borderBottom: `1px solid ${C.s200}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <span>General Fund Financial Status</span>
-        <ExportBtn onClick={() => downloadCsv('ne_gf_status.csv', ['Line Item', ...fyL], table.map((r) => [r.label, ...fys.map((k) => r[k])]))} />
+        <ExportBtn onClick={() => downloadCsv('ne_gf_status.csv', ['Line Item', ...years], table.map((row) => [row.label, ...years.map((fy) => row.values?.[fy])]))} />
       </div>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5, minWidth: 680 }}>
-        <thead><tr style={{ background: C.navy, color: '#fff' }}><th style={{ textAlign: 'left', padding: '10px 14px', fontSize: 10, textTransform: 'uppercase', letterSpacing: 1 }}>Line item</th>{fyL.map((h) => <th key={h} style={{ textAlign: 'right', padding: '10px 14px', fontSize: 10, textTransform: 'uppercase', letterSpacing: 1 }}>{h}</th>)}</tr></thead>
-        <tbody>{table.map((row, idx) => { const hl = String(row.label || '').includes('Ending') || String(row.label || '').includes('Appropriation'); return <tr key={row.label || idx} style={{ background: hl ? C.goldDim : idx % 2 === 0 ? C.s50 : '#fff', borderBottom: `1px solid ${C.s100}`, fontWeight: hl ? 700 : 400 }}><td style={{ padding: '9px 14px', color: C.navy }}>{row.label}</td>{fys.map((k) => { const v = row[k]; return <td key={k} style={{ padding: '9px 14px', textAlign: 'right', color: v < 0 ? C.red : C.s800 }}>{v == null ? '—' : v < 0 ? `(${fmt(Math.abs(v))})` : fmt(v)}</td>; })}</tr>; })}</tbody>
+        <thead><tr style={{ background: C.navy, color: '#fff' }}><th style={{ textAlign: 'left', padding: '10px 14px', fontSize: 10, textTransform: 'uppercase', letterSpacing: 1 }}>Line item</th>{years.map((fy) => <th key={fy} style={{ textAlign: 'right', padding: '10px 14px', fontSize: 10, textTransform: 'uppercase', letterSpacing: 1 }}>{fy}</th>)}</tr></thead>
+        <tbody>{table.map((row, idx) => { const highlight = String(row.label || '').includes('Ending') || String(row.label || '').includes('Appropriation'); return <tr key={row.label || idx} style={{ background: highlight ? C.goldDim : idx % 2 === 0 ? C.s50 : '#fff', borderBottom: `1px solid ${C.s100}`, fontWeight: highlight ? 700 : 400 }}><td style={{ padding: '9px 14px', color: C.navy }}>{row.label}</td>{years.map((fy) => { const value = row.values?.[fy]; return <td key={fy} style={{ padding: '9px 14px', textAlign: 'right', color: value < 0 ? C.red : C.s800 }}>{value == null ? '—' : value < 0 ? `(${fmt(Math.abs(value))})` : fmt(value)}</td>; })}</tr>; })}</tbody>
       </table>
-    </div>}
-
-    {(crH.length > 0 || xfrs.length > 0) && <div className="two-col">
-      {crH.length > 0 && <div style={panel}>
-        <div style={{ fontWeight: 800, color: C.navy, marginBottom: 4 }}>Cash Reserve Fund — historical</div>
-        <div style={{ fontSize: 12.5, color: C.s500, marginBottom: 14 }}>Dashed = estimates.</div>
-        <div style={{ height: 220 }}><ResponsiveContainer width="100%" height="100%"><AreaChart data={crH}>
-          <defs><linearGradient id="crG" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={C.navy} stopOpacity={.12} /><stop offset="100%" stopColor={C.navy} stopOpacity={.01} /></linearGradient></defs>
-          <CartesianGrid vertical={false} strokeDasharray="3 3" stroke={C.s200} /><XAxis dataKey="fy" tick={{ fill: C.s500, fontSize: 10 }} axisLine={false} tickLine={false} interval={1} /><YAxis tick={{ fill: C.s500, fontSize: 10 }} axisLine={false} tickLine={false} width={50} tickFormatter={(v) => `$${v}M`} />
-          <ReTooltip formatter={(v) => `$${v.toFixed(0)}M`} /><Area type="monotone" dataKey="bal" stroke={C.navy} strokeWidth={2.5} fill="url(#crG)" dot={{ r: 3, fill: C.gold, stroke: C.navy, strokeWidth: 2 }} />
-        </AreaChart></ResponsiveContainer></div>
-      </div>}
-
-      {xfrs.length > 0 && <div style={panel}>
-        <div style={{ fontWeight: 800, color: C.navy, marginBottom: 4 }}>Transfers-out (FY25-26)</div>
-        <div style={{ fontSize: 12.5, color: C.s500, marginBottom: 12 }}>Total: {fmt(xfrs.reduce((s, t) => s + (t.amount || 0), 0))}</div>
-        {xfrs.map((t, i) => <div key={t.target || i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: i < xfrs.length - 1 ? `1px solid ${C.s100}` : 'none' }}>
-          <div><div style={{ fontWeight: 600, fontSize: 13 }}>{t.target}</div><div style={{ fontSize: 11, color: C.s400, marginTop: 1 }}>{t.note}</div></div>
-          <div style={{ textAlign: 'right' }}><div style={{ fontWeight: 700, fontSize: 14 }}>{fmtC(t.amount)}</div>{t.pct != null && <div style={{ fontSize: 10, color: C.s400 }}>{t.pct}%</div>}</div>
-        </div>)}
-      </div>}
-    </div>}
-
-    {xfrH.length > 0 && <div style={panel}>
-      <div style={{ fontWeight: 700, color: C.s500, fontSize: 12, marginBottom: 10 }}>Historical transfers-out ($M)</div>
-      <div style={{ height: 150 }}><ResponsiveContainer width="100%" height="100%"><BarChart data={xfrH}><CartesianGrid vertical={false} strokeDasharray="3 3" stroke={C.s200} /><XAxis dataKey="fy" tick={{ fill: C.s500, fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis tick={{ fill: C.s500, fontSize: 10 }} axisLine={false} tickLine={false} width={40} /><ReTooltip formatter={(v) => `$${v}M`} /><Bar dataKey="total" radius={[4, 4, 0, 0]}>{xfrH.map((d, i) => <Cell key={i} fill={d.est ? C.s300 : C.navy} />)}</Bar></BarChart></ResponsiveContainer></div>
     </div>}
   </div>;
 }
 
 /* ═══════════════════ AGENCIES ═══════════════════ */
 
-function AgenciesTab({ agencies }) {
+function AgenciesTab({ agencies, population = NE_POP_FALLBACK }) {
   if (!agencies || agencies.length === 0) return <div style={panel}>No agency data loaded.</div>;
-  const sorted = [...agencies].sort((a, b) => ((b.appropriation || 0) + (b.cash_fund || 0)) - ((a.appropriation || 0) + (a.cash_fund || 0)));
+  const sorted = [...agencies].sort((a, b) => (b.all_funds || 0) - (a.all_funds || 0));
   const totalGF = sorted.reduce((s, a) => s + (a.appropriation || 0), 0);
   const topAgency = sorted[0];
 
   return <div style={{ display: 'grid', gap: 12 }}>
     <Narrative>
-      Nebraska appropriates <strong>{fmtC(totalGF)}</strong> in General Fund dollars — about <strong>${Math.round(totalGF / NE_POP).toLocaleString()} per resident</strong>.
-      {topAgency && topAgency.appropriation > 0 && <> {topAgency.name} alone accounts for {fmtP(topAgency.appropriation / totalGF)} of all GF spending, or ${Math.round(topAgency.appropriation / NE_POP).toLocaleString()} per Nebraskan.</>}
+      Nebraska appropriates <strong>{fmtC(totalGF)}</strong> in General Fund dollars — about <strong>${Math.round(totalGF / population).toLocaleString()} per resident</strong>.
+      {topAgency && topAgency.appropriation > 0 && <> {topAgency.name} accounts for {fmtP(topAgency.appropriation / totalGF)} of General Fund appropriations, or ${Math.round(topAgency.appropriation / population).toLocaleString()} per resident.</>}
     </Narrative>
 
     <div style={{ ...panel, borderLeft: `4px solid ${C.blue}`, background: C.blueDim }}>
       <div style={{ fontSize: 13, color: '#1E3A5F', lineHeight: 1.6 }}>
         <strong>Reading this:</strong>{' '}
         <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: C.navy, verticalAlign: 'middle', marginRight: 3 }} /> General Fund (Legislature-controlled) vs.{' '}
-        <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: C.goldLight, verticalAlign: 'middle', marginLeft: 6, marginRight: 3 }} /> Cash Fund (earmarked fees/federal).
+        <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: C.goldLight, verticalAlign: 'middle', marginLeft: 6, marginRight: 3 }} /> Other funds (cash, construction, federal, and revolving). Cash funds are generally earmarked fees and charges; federal funds are reported separately.
       </div>
     </div>
 
     <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-      <ExportBtn onClick={() => downloadCsv('ne_agency_appropriations.csv', ['Agency ID', 'Name', 'GF Appropriation', 'Cash Fund', 'Total', 'Per Capita GF'], sorted.map((a) => [a.id, a.name, a.appropriation, a.cash_fund, (a.appropriation || 0) + (a.cash_fund || 0), Math.round((a.appropriation || 0) / NE_POP)]))} />
+      <ExportBtn onClick={() => downloadCsv('ne_agency_appropriations.csv', ['Agency ID', 'Name', 'General', 'Cash', 'Construction', 'Federal', 'Revolving', 'Total'], sorted.map((a) => [a.id, a.name, a.general_fund, a.cash_fund, a.construction_fund, a.federal_fund, a.revolving_fund, a.all_funds]))} />
     </div>
 
     {sorted.map((a) => {
-      const gf = a.appropriation || 0, cf = a.cash_fund || 0, total = gf + cf;
+      const gf = a.appropriation || 0, cf = a.cash_fund || 0, total = a.all_funds || gf + cf;
       const share = total > 0 ? gf / total : 0;
-      const perCap = Math.round(gf / NE_POP);
+      const perCap = Math.round(gf / population);
       return <div key={a.id} style={panel}>
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14, alignItems: 'flex-start', flexWrap: 'wrap' }}>
           <div><div style={{ fontSize: 11, color: C.s500, textTransform: 'uppercase', letterSpacing: 1.2 }}>Agency {a.id}</div><div style={{ fontSize: 15, fontWeight: 800, color: C.navy, marginTop: 4 }}>{a.name}</div></div>
@@ -505,7 +476,7 @@ function AgenciesTab({ agencies }) {
         <div style={{ marginTop: 12, height: 10, background: C.s100, borderRadius: 999, overflow: 'hidden', display: 'flex' }}><div style={{ width: `${share * 100}%`, background: C.navy }} /><div style={{ flex: 1, background: C.goldLight }} /></div>
         <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: 12, color: C.s500, flexWrap: 'wrap' }}>
           <div><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: C.navy, marginRight: 4 }} />GF: {fmt(gf)} ({fmtP(share)})</div>
-          <div><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: C.goldLight, marginRight: 4 }} />CF: {fmt(cf)}</div>
+          <div><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: C.goldLight, marginRight: 4 }} />Other funds: {fmt(total - gf)}</div>
         </div>
       </div>;
     })}
@@ -539,25 +510,25 @@ function FundsTab({ funds, selectedId, onSelect, showDormantInit = false }) {
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
           <div style={{ fontWeight: 800, color: C.navy }}>Fund Explorer</div>
           <div style={{ display: 'flex', gap: 8 }}>
-            <button type="button" onClick={() => setShowDormant((v) => !v)} style={{ border: `1px solid ${showDormant ? C.amber : C.s300}`, background: showDormant ? C.amberDim : '#fff', color: showDormant ? '#92400E' : C.s700, borderRadius: 8, padding: '6px 11px', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6 }}><Ghost style={{ width: 14, height: 14 }} />{showDormant ? `Dormant (${dCt})` : 'Show dormant'}</button>
-            <ExportBtn onClick={() => downloadCsv('ne_funds.csv', ['ID', 'Title', 'Category', 'Balance', 'Interest', 'MoM Delta', 'Dormant', 'Agency', 'Statute', 'Description'], filtered.map((f) => [f.id, f.title, f.category, f.balance, f.interest, f.delta, f.dormant, f.agency_name, f.statutory_authority, f.description]))} />
+            <button type="button" onClick={() => setShowDormant((v) => !v)} style={{ border: `1px solid ${showDormant ? C.amber : C.s300}`, background: showDormant ? C.amberDim : '#fff', color: showDormant ? '#92400E' : C.s700, borderRadius: 8, padding: '6px 11px', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6 }}><FileText style={{ width: 14, height: 14 }} />{showDormant ? `Reference-only (${dCt})` : 'Show reference-only'}</button>
+            <ExportBtn onClick={() => downloadCsv('ne_funds.csv', ['ID', 'Title', 'Category', 'OIP Average Daily Balance', 'Allocated Interest', 'Reference Only', 'Agency', 'Statute', 'Description'], filtered.map((f) => [f.id, f.title, f.category, f.balance, f.interest, f.dormant, f.agency_name, f.statutory_authority, f.description]))} />
           </div>
         </div>
         <div style={{ position: 'relative', marginTop: 12 }}><Search style={{ width: 15, height: 15, color: C.s400, position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)' }} /><input value={rawSearch} onChange={(e) => setRawSearch(e.target.value)} placeholder="Search funds, agencies, statutes..." style={{ width: '100%', padding: '10px 12px 10px 32px', borderRadius: 10, border: `1px solid ${C.s300}`, background: '#fff' }} /></div>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 12 }}>{cats.map((c) => <button key={c} type="button" onClick={() => setCat(c)} style={{ border: cat === c ? 'none' : `1px solid ${C.s300}`, background: cat === c ? C.navy : '#fff', color: cat === c ? '#fff' : C.s700, borderRadius: 999, padding: '5px 10px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>{c}</button>)}</div>
-        <div style={{ marginTop: 10, fontSize: 11, color: C.s500 }}>{filtered.length} fund{filtered.length !== 1 ? 's' : ''} · <span style={{ color: C.emerald }}>{filtered.filter((f) => !f.dormant && f.balance > 0).length} active</span>{showDormant && <> · <span style={{ color: C.amber }}>{filtered.filter((f) => f.dormant).length} dormant</span></>}</div>
+        <div style={{ marginTop: 10, fontSize: 11, color: C.s500 }}>{filtered.length} fund{filtered.length !== 1 ? 's' : ''} · <span style={{ color: C.emerald }}>{filtered.filter((f) => !f.dormant).length} in latest OIP</span>{showDormant && <> · <span style={{ color: C.amber }}>{filtered.filter((f) => f.dormant).length} directory-only</span></>}</div>
       </div>
       <div style={{ maxHeight: 640, overflowY: 'auto' }}>{filtered.map((f) => <button key={f.id} type="button" onClick={() => onSelect(f.id)} style={{ width: '100%', border: 'none', background: sel?.id === f.id ? '#EFF6FF' : f.dormant ? C.amberDim : '#fff', borderBottom: `1px solid ${C.s100}`, borderLeft: sel?.id === f.id ? `3px solid ${C.navy}` : '3px solid transparent', padding: 14, textAlign: 'left', cursor: 'pointer' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14, alignItems: 'flex-start' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>{f.dormant && <Ghost style={{ width: 13, height: 13, color: '#D97706', flexShrink: 0 }} />}<div><div style={{ fontSize: 12.5, fontWeight: 700, color: f.dormant ? '#92400E' : C.navy }}>{f.title}</div><div style={{ fontSize: 10.5, color: C.s400, marginTop: 2 }}>#{f.id} · {f.category}{f.agency_name ? ` · ${f.agency_name}` : ''}</div></div></div>
-          <div style={{ textAlign: 'right', flexShrink: 0 }}>{f.dormant ? <Badge text="DORMANT" color="#92400E" bg="rgba(245,158,11,.14)" /> : <><div style={{ fontWeight: 800, fontSize: 13 }}>{fmtC(f.balance)}</div>{f.delta !== 0 && <div style={{ marginTop: 4 }}><Delta value={f.delta} compact /></div>}</>}</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>{f.dormant && <FileText style={{ width: 13, height: 13, color: '#D97706', flexShrink: 0 }} />}<div><div style={{ fontSize: 12.5, fontWeight: 700, color: f.dormant ? '#92400E' : C.navy }}>{f.title}</div><div style={{ fontSize: 10.5, color: C.s400, marginTop: 2 }}>#{f.id} · {f.category}{f.agency_name ? ` · ${f.agency_name}` : ''}</div></div></div>
+          <div style={{ textAlign: 'right', flexShrink: 0 }}>{f.dormant ? <Badge text="REFERENCE ONLY" color="#92400E" bg="rgba(245,158,11,.14)" /> : <><div style={{ fontWeight: 800, fontSize: 13 }}>{fmtC(f.balance)}</div>{f.delta !== 0 && <div style={{ marginTop: 4 }}><Delta value={f.delta} compact /></div>}</>}</div>
         </div>
       </button>)}{filtered.length === 0 && <div style={{ padding: 40, textAlign: 'center', color: C.s400 }}>No funds match.</div>}</div>
     </div>
 
     <div>{sel ? <div style={{ ...card, position: 'sticky', top: 72 }}>
       <div style={{ padding: 20, background: `linear-gradient(135deg, ${sel.dormant ? '#92400E' : C.navy}, ${sel.dormant ? '#B45309' : C.navyMid})`, color: '#fff', display: 'flex', justifyContent: 'space-between', gap: 14, alignItems: 'flex-start' }}>
-        <div><div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}><div style={{ fontSize: 11, color: sel.dormant ? '#FDE68A' : C.goldLight, textTransform: 'uppercase', letterSpacing: 1.3 }}>Fund {sel.id} · {sel.category}</div>{sel.dormant && <Badge text="DORMANT" color="#FDE68A" bg="rgba(253,230,138,.14)" />}</div><div style={{ fontSize: 18, fontWeight: 900, marginTop: 6 }}>{sel.title}</div></div>
+        <div><div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}><div style={{ fontSize: 11, color: sel.dormant ? '#FDE68A' : C.goldLight, textTransform: 'uppercase', letterSpacing: 1.3 }}>Fund {sel.id} · {sel.category}</div>{sel.dormant && <Badge text="REFERENCE ONLY" color="#FDE68A" bg="rgba(253,230,138,.14)" />}</div><div style={{ fontSize: 18, fontWeight: 900, marginTop: 6 }}>{sel.title}</div></div>
         <button type="button" onClick={() => onSelect(null)} style={{ border: 'none', background: 'rgba(255,255,255,.12)', color: '#fff', borderRadius: 8, padding: 6, cursor: 'pointer' }}><X style={{ width: 15, height: 15 }} /></button>
       </div>
       <div style={{ padding: 20 }}>
@@ -567,11 +538,11 @@ function FundsTab({ funds, selectedId, onSelect, showDormantInit = false }) {
           <XAxis dataKey="m" tick={{ fill: C.s400, fontSize: 10 }} axisLine={false} tickLine={false} /><ReTooltip formatter={(v) => `$${v}M`} /><Area type="monotone" dataKey="b" stroke={sel.delta >= 0 ? C.emerald : C.red} strokeWidth={2.5} fill="url(#dG)" dot={{ r: 3, fill: C.gold, stroke: sel.delta >= 0 ? C.emerald : C.red, strokeWidth: 2 }} /></AreaChart></ResponsiveContainer></div>
         </div>}
         {sel.description ? <div style={{ fontSize: 13, color: C.s700, lineHeight: 1.7, marginBottom: 18 }}>{sel.description}</div> : <div style={{ fontSize: 12.5, color: C.s400, fontStyle: 'italic', marginBottom: 18 }}>No description available in the LFO Directory for this fund.</div>}
-        {sel.dormant && <div style={{ background: C.redDim, border: '1px solid #FECACA', borderRadius: 8, padding: 12, marginBottom: 18 }}>
-          <div style={{ fontSize: 12.5, color: '#7F1D1D', lineHeight: 1.7, fontWeight: 600, display: 'flex', alignItems: 'flex-start', gap: 6 }}><AlertTriangle style={{ width: 14, height: 14, marginTop: 2, flexShrink: 0 }} /><span>Legislative action recommended: Zero OIP balance. {sel.ending_balance > 0 ? `LFO reports ${fmt(sel.ending_balance)} — verify and consider transfer to GF or formal elimination.` : 'Consider formal elimination via statute repeal.'}</span></div>
+        {sel.dormant && <div style={{ background: C.amberDim, border: '1px solid #FDE68A', borderRadius: 8, padding: 12, marginBottom: 18 }}>
+          <div style={{ fontSize: 12.5, color: '#92400E', lineHeight: 1.7, fontWeight: 600, display: 'flex', alignItems: 'flex-start', gap: 6 }}><AlertTriangle style={{ width: 14, height: 14, marginTop: 2, flexShrink: 0 }} /><span>This fund appears in the LFO directory but not in the latest OIP report. OIP absence alone does not show whether it is active, abolished, or has another type of balance.</span></div>
         </div>}
         <div style={{ display: 'grid', gap: 8 }}>{[
-          ['Current balance', sel.dormant ? 'Dormant — $0 in OIP' : fmt(sel.balance)],
+          ['Latest OIP average daily balance', sel.dormant ? 'No entry in latest OIP report' : fmt(sel.balance)],
           ...(sel.delta && !sel.dormant ? [['Month-over-month', (sel.delta >= 0 ? '+' : '') + fmt(sel.delta)]] : []),
           ['Statutory authority', sel.statutory_authority || 'Not provided'],
           ['Agency', sel.agency_name || 'N/A'],
@@ -587,15 +558,16 @@ function FundsTab({ funds, selectedId, onSelect, showDormantInit = false }) {
 
 /* ═══════════════════ REFERENCE ═══════════════════ */
 
-function ReferenceTab() {
+function ReferenceTab({ data }) {
+  const population = data.population?.value || NE_POP_FALLBACK;
   const secs = [
-    { t: 'Fund Types', items: [{ t: 'General Fund (10000)', d: 'All receipts not earmarked by statute. Funded by income/sales taxes.' }, { t: 'Cash Funds (20000s)', d: 'Dedicated fees and charges. Money restricted to statutory purpose.' }, { t: 'Federal Funds (40000s)', d: 'Grants, contracts, matching funds from the federal government.' }, { t: 'Revolving Funds (50000s)', d: 'Interagency transactions — one agency provides goods/services to another.' }, { t: 'Trust Funds (60000s)', d: 'Fiduciary funds held for individuals/entities.' }, { t: 'Dormant Fund', d: 'Zero OIP cash balance. Review for elimination or refunding.' }] },
-    { t: 'Budget Terms', items: [{ t: 'Average Daily Balance (ADB)', d: 'Weighted average cash held in a fund over the month. Basis for pro-rata interest allocation.' }, { t: 'NEFAB', d: 'Nebraska Economic Forecasting Advisory Board. Sets official revenue forecasts. Meets 3×/year.' }, { t: 'Minimum Reserve', d: 'Constitutionally required 3% ending balance for the GF at biennium end.' }, { t: 'Per Capita', d: `Divided by Nebraska's estimated population (${(NE_POP / 1e6).toFixed(2)}M).` }] },
-    { t: 'Data Sources', items: [{ t: 'OIP Report', d: 'Monthly from DAS State Accounting.' }, { t: 'Biennial Budget Report', d: 'Appropriations Committee per session.' }, { t: 'LFO Directory', d: 'Annual from Legislative Fiscal Office. Statutory authority for every fund.' }] },
+    { t: 'Fund Types', items: [{ t: 'General Fund (10000)', d: 'Receipts not earmarked by statute, including major income and sales taxes.' }, { t: 'Cash Funds (20000s)', d: 'Dedicated fees and charges restricted to statutory purposes.' }, { t: 'Federal Funds (40000s)', d: 'Grants, contracts, and matching funds from the federal government.' }, { t: 'Revolving Funds (50000s)', d: 'Interagency transactions where one agency provides goods or services to another.' }, { t: 'Trust Funds (60000s)', d: 'Fiduciary funds held for individuals or entities.' }, { t: 'Reference-only record', d: 'Listed in the LFO directory but absent from the latest OIP report. This is not a finding that the fund is dormant.' }] },
+    { t: 'Budget Terms', items: [{ t: 'Average Daily Balance (ADB)', d: 'Weighted average cash held in a fund over the reporting month; this is not a point-in-time ending balance.' }, { t: 'NEFAB', d: 'Nebraska Economic Forecasting Advisory Board, which establishes official General Fund revenue forecasts.' }, { t: 'Minimum Reserve', d: 'A statutory 3% minimum reserve calculation at the end of a biennium.' }, { t: 'Per Capita', d: `Divided by the Census Bureau's July 1, 2025 Nebraska population estimate (${(population / 1e6).toFixed(2)}M).` }] },
+    { t: 'Data Sources', items: [{ t: 'OIP Report', d: 'Monthly average daily balances and allocated interest from DAS State Accounting.' }, { t: 'General Fund Financial Status', d: 'Official legislative snapshot; it updates on a different schedule from monthly revenue reports.' }, { t: 'Current Fiscal Year Budget', d: 'Agency appropriations by General, Cash, Construction, Federal, and Revolving funds.' }, { t: 'LFO Directory', d: 'Legislative Fiscal Office reference information and statutory authority for state funds.' }] },
   ];
   return <div style={{ display: 'grid', gap: 18 }}><div><div style={{ fontSize: 20, fontWeight: 900, color: C.navy }}>Reference & Definitions</div></div>
     {secs.map((sec) => <div key={sec.t} style={panel}><div style={{ fontWeight: 800, color: C.navy, marginBottom: 12 }}>{sec.t}</div>{sec.items.map((i) => <div key={i.t} style={{ padding: '10px 0', borderBottom: `1px solid ${C.s100}` }}><div style={{ fontWeight: 700, fontSize: 13, color: C.s800, marginBottom: 3 }}>{i.t}</div><div style={{ fontSize: 12.5, color: C.s500, lineHeight: 1.7 }}>{i.d}</div></div>)}</div>)}
-    <div style={{ ...panel, background: C.goldDim, borderLeft: `4px solid ${C.gold}` }}><div style={{ fontSize: 12.5, color: '#713F12', lineHeight: 1.7 }}><strong>Sources:</strong>{' '}<a href="https://nebraskalegislature.gov/reports/fiscal.php" target="_blank" rel="noreferrer" style={{ color: C.navyMid }}>Fiscal Reports</a> · <a href="https://revenue.nebraska.gov/research/statistics" target="_blank" rel="noreferrer" style={{ color: C.navyMid }}>Revenue Statistics</a> · <a href="https://das.nebraska.gov/accounting/financial_reports.php" target="_blank" rel="noreferrer" style={{ color: C.navyMid }}>DAS Accounting</a></div></div>
+    <div style={{ ...panel, background: C.goldDim, borderLeft: `4px solid ${C.gold}` }}><div style={{ fontSize: 12.5, color: '#713F12', lineHeight: 1.7 }}><strong>Official sources:</strong>{' '}<a href="https://nebraskalegislature.gov/reports/fiscal.php" target="_blank" rel="noreferrer" style={{ color: C.navyMid }}>Fiscal Reports</a> · <a href="https://revenue.nebraska.gov/about/news-releases/general-fund-receipts-news-releases" target="_blank" rel="noreferrer" style={{ color: C.navyMid }}>General Fund Receipts</a> · <a href="https://das.nebraska.gov/accounting/financial_reports.php" target="_blank" rel="noreferrer" style={{ color: C.navyMid }}>DAS Accounting</a> · <a href="https://statespending.nebraska.gov/CurrentFiscalYearBudget" target="_blank" rel="noreferrer" style={{ color: C.navyMid }}>Current Fiscal Year Budget</a></div></div>
   </div>;
 }
 
@@ -685,7 +657,7 @@ export default function NebraskaBudgetDashboard() {
           <AlertTriangle style={{ width: 48, height: 48, color: C.red, marginBottom: 16 }} />
           <h2>Data Sync Error</h2>
           <p style={{ color: C.s700, marginTop: 12, lineHeight: 1.7 }}>{error}</p>
-          <p style={{ color: C.s500, marginTop: 12, fontSize: 13 }}>Check the browser console for details. The Apps Script URL may need re-deployment.</p>
+          <p style={{ color: C.s500, marginTop: 12, fontSize: 13 }}>The public data file may not have been generated yet. Check the latest GitHub Actions run.</p>
         </div>
       </div>
     );
@@ -693,7 +665,7 @@ export default function NebraskaBudgetDashboard() {
 
   const hasDescriptions = data.funds.some((f) => f.description);
   const hasGfStatus = data.gfStatusTable && data.gfStatusTable.length > 0;
-  const showDataWarning = !hasDescriptions || !hasGfStatus;
+  const showDataWarning = !hasDescriptions || !hasGfStatus || data.warnings.length > 0;
 
   return (
     <div style={{ minHeight: '100vh', background: C.s50, color: C.s800, fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif' }}>
@@ -718,7 +690,7 @@ export default function NebraskaBudgetDashboard() {
           <div style={{ fontSize: 11, color: 'rgba(255,255,255,.68)', lineHeight: 1.7 }}>
             <div>Cash: <span style={{ color: '#fff' }}>{data.lastUpdated?.cash || 'Unknown'}</span></div>
             <div>Budget: <span style={{ color: '#fff' }}>{data.lastUpdated?.budget || 'Unknown'}</span></div>
-            {data.lastUpdated?.nefab && <div>NEFAB: <span style={{ color: '#fff' }}>{data.lastUpdated.nefab}</span></div>}
+            <div>Revenue: <span style={{ color: '#fff' }}>{data.lastUpdated?.revenue || data.revenue?.period || 'Unknown'}</span></div>
           </div>
         </div>
       </header>
@@ -738,7 +710,7 @@ export default function NebraskaBudgetDashboard() {
                 <strong>Partial data loaded.</strong>{' '}
                 {!hasDescriptions && 'No fund descriptions from LFO Directory are available. '}
                 {!hasGfStatus && 'General Fund Status table is missing. '}
-                Open browser DevTools console for shape details. The scraper may need to rerun, or the Apps Script {'doGet()'} may not be returning the complete dataset.
+                {data.warnings.length > 0 && data.warnings.join(' ')}
               </div>
             </div>
           </div>
@@ -748,9 +720,9 @@ export default function NebraskaBudgetDashboard() {
           {tab === 'overview' && <OverviewTab data={data} onNav={navigate} />}
           {tab === 'revenue' && <RevenueTab revenue={data.revenue} />}
           {tab === 'gfstatus' && <GFStatusTab data={data} />}
-          {tab === 'agencies' && <AgenciesTab agencies={data.agencies} />}
+          {tab === 'agencies' && <AgenciesTab agencies={data.agencies} population={data.population?.value || NE_POP_FALLBACK} />}
           {tab === 'funds' && <FundsTab funds={data.funds} selectedId={selectedFundId} onSelect={selectFund} showDormantInit={showDormantInit} />}
-          {tab === 'reference' && <ReferenceTab />}
+          {tab === 'reference' && <ReferenceTab data={data} />}
         </ErrorBoundary>
       </main>
 
@@ -760,4 +732,3 @@ export default function NebraskaBudgetDashboard() {
     </div>
   );
 }
-
