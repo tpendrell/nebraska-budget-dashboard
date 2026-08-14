@@ -16,11 +16,12 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
 from openpyxl import load_workbook
@@ -118,7 +119,7 @@ def utc_now() -> str:
 
 
 def fetch_bytes(url: str, timeout: int = 60) -> tuple[bytes, str]:
-    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+    request = Request(quote(url, safe=":/?&=%+#"), headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
     try:
         with urlopen(request, timeout=timeout) as response:
             body = response.read()
@@ -454,7 +455,7 @@ def parse_gf_status_text(text: str, as_of: date | None = None) -> dict:
         ("General Fund Net Revenues", r"General\s+Fund\s+Net\s+Revenues"),
         ("General Fund Appropriations", r"General\s+Fund\s+Appropriations"),
         ("Ending Balance", r"Ending\s+Balance"),
-        ("Minimum Reserve at 3%", r"Minimum\s+Reserve(?:\s+at)?\s+3%"),
+        ("Minimum Reserve at 3%", r"Min(?:imum)?\.?\s+Reserve(?:\s+at)?\s+3(?:\.0)?%"),
         ("Excess / (Shortfall)", r"Excess\s*/?\s*\(?Shortfall\)?"),
     ]
     for section in candidates:
@@ -469,9 +470,11 @@ def parse_gf_status_text(text: str, as_of: date | None = None) -> dict:
             continue
         rows = []
         for label, pattern in row_specs:
-            values = _find_table_row(section, pattern, len(found_years))
+            sparse_biennium_row = label in {"Minimum Reserve at 3%", "Excess / (Shortfall)"}
+            values = _find_table_row(section, pattern, 2 if sparse_biennium_row else len(found_years))
             if values:
-                rows.append({"label": label, "values": dict(zip(found_years, values[:len(found_years)]))})
+                used_years = found_years if len(values) >= len(found_years) else found_years[-len(values):]
+                rows.append({"label": label, "values": dict(zip(used_years, values[:len(used_years)]))})
         if len(rows) >= 4:
             # The official one-page status centers biennium-only reserve cells
             # between two fiscal-year columns. pdftotext places those values in
@@ -640,10 +643,20 @@ def discover_revenue_release(links: Iterable[Link], target: date | None = None) 
 
 
 def parse_revenue_text(text: str, period: str) -> dict:
-    net_matches = list(re.finditer(r"^\s*Net\s+Receipts\s*$", text, re.I | re.M))
-    if not net_matches:
+    candidates = []
+    for page in text.split("\f"):
+        for match in re.finditer(r"^\s*Net\s+Receipts\s*:?\s*$", page, re.I | re.M):
+            candidates.append((page, match.start()))
+    if not candidates:
         raise SourceError("Revenue release did not contain a Net Receipts table")
-    section = text[net_matches[-1].start():net_matches[-1].start() + 9000]
+    # Current releases place the forecast table before a second table comparing
+    # the current year with the previous year. Select the page whose headings
+    # identify projected/forecast values instead of blindly using the last table.
+    selected_page, selected_start = next(
+        ((page, start) for page, start in candidates if re.search(r"Projected|Forecast", page, re.I)),
+        candidates[-1],
+    )
+    section = selected_page[selected_start:]
 
     def row(pattern: str) -> list[int]:
         return _find_table_row(section, pattern, 2)
@@ -651,16 +664,16 @@ def parse_revenue_text(text: str, period: str) -> dict:
     def actual_forecast(values: list[int]) -> tuple[int, int]:
         return (values[3], values[4]) if len(values) >= 5 else (values[0], values[1])
 
-    total_values = row(r"Total\s+Net\s+Receipts")
+    total_values = row(r"Total\s+Net(?:\s+Receipts)?")
     if len(total_values) < 2:
         raise SourceError("Revenue release Net Receipts total row was not parseable")
     ytd_actual, ytd_forecast = actual_forecast(total_values)
     categories = []
     for name, pattern in [
         ("Sales & Use", r"Sales\s+(?:and|&)\s+Use\s+Tax"),
-        ("Individual Income", r"Individual\s+Income\s+Tax"),
-        ("Corporate Income", r"Corporate\s+Income\s+Tax"),
-        ("Miscellaneous", r"Miscellaneous"),
+        ("Individual Income", r"(?:Individual|Ind)\s+Income\s+Tax"),
+        ("Corporate Income", r"(?:Corporate|Corp)\s+Income\s+Tax"),
+        ("Miscellaneous", r"Misc(?:ellaneous)?(?:\s+Taxes)?"),
     ]:
         values = row(pattern)
         if len(values) >= 2:
@@ -672,6 +685,13 @@ def parse_revenue_text(text: str, period: str) -> dict:
         text,
         re.I,
     )
+    if not basis_match:
+        basis_match = re.search(
+            r"forecast.{0,160}?\bon\s+((?:January|February|March|April|May|June|July|August|September|October|November|December)"
+            r"\s+\d{1,2},\s+20\d{2})",
+            text,
+            re.I | re.S,
+        )
     return {
         "period": period,
         "ytdActual": ytd_actual,
@@ -685,6 +705,39 @@ def parse_revenue_text(text: str, period: str) -> dict:
 
 # Current fiscal-year agency appropriations
 
+def _parse_agency_budget_spans(source: str) -> list[dict]:
+    """Parse the State Spending site's current div/span-based agency listing."""
+    rows: dict[int, dict[str, str]] = {}
+    fields = {
+        "Agency": "name",
+        "General": "general_fund",
+        "Cash": "cash_fund",
+        "Construction": "construction_fund",
+        "Federal": "federal_fund",
+        "Revolving": "revolving_fund",
+        "Total": "all_funds",
+    }
+    for label, key in fields.items():
+        pattern = rf'<span\b[^>]*\bid=["\']{label}Label_(\d+)["\'][^>]*>(.*?)</span>'
+        for index_text, fragment in re.findall(pattern, source, re.I | re.S):
+            value = unescape(re.sub(r"<[^>]+>", "", fragment)).strip()
+            rows.setdefault(int(index_text), {})[key] = value
+
+    agencies = []
+    for index in sorted(rows):
+        row = rows[index]
+        name = row.get("name", "").strip()
+        if not name or name.lower().startswith("total"):
+            continue
+        agency = {"id": str(index), "name": name}
+        for key in ("general_fund", "cash_fund", "construction_fund", "federal_fund", "revolving_fund", "all_funds"):
+            agency[key] = round(_number(row.get(key, "0")))
+        agency["appropriation"] = agency["general_fund"]
+        if agency["all_funds"] or agency["general_fund"]:
+            agencies.append(agency)
+    return agencies
+
+
 def parse_agency_budget_html(html: str) -> tuple[list[dict], str]:
     parser = TableParser()
     parser.feed(html)
@@ -697,7 +750,12 @@ def parse_agency_budget_html(html: str) -> tuple[list[dict], str]:
             selected = table
             break
     if selected is None:
-        raise SourceError("Current Fiscal Year Budget page did not contain the expected agency table")
+        agencies = _parse_agency_budget_spans(html)
+        if len(agencies) < 10:
+            raise SourceError("Current Fiscal Year Budget page did not contain the expected agency listing")
+        fy_match = re.search(r"(?:Fiscal Year|FY)\s*(20\d{2})\s*[-–/]\s*(20\d{2}|\d{2})", html, re.I)
+        fy = f"FY{fy_match.group(1)}-{fy_match.group(2)[-2:]}" if fy_match else fiscal_year_label()
+        return agencies, fy
     headers = [_normalized_header(value) for value in selected[0]]
 
     def column(needle: str) -> int | None:
@@ -801,6 +859,7 @@ def build_dashboard(output: Path, target: date | None = None) -> dict:
     budget_path = None
     status_path = None
     directory_paths: list[Path] = []
+    documents = {"status": None, "budget": None, "directories": []}
     try:
         _, legislature_links = official_links(LEGISLATURE_REPORTS_URL)
         legislature_links = [
@@ -808,23 +867,30 @@ def build_dashboard(output: Path, target: date | None = None) -> dict:
             *legislature_links,
         ]
         documents = discover_legislature_documents(legislature_links)
-        if documents["status"]:
-            status_path = download_document(documents["status"].url, work_dir / "gf-status.pdf", "pdf")
-        if documents["budget"]:
-            budget_path = download_document(documents["budget"].url, work_dir / "budget-report.pdf", "pdf")
-        for index, link in enumerate(documents["directories"]):
-            try:
-                directory_paths.append(download_document(link.url, work_dir / f"lfo-directory-{index}.pdf", "pdf"))
-            except SourceError as exc:
-                warnings.append(f"LFO directory volume skipped: {exc}")
     except Exception as exc:
         warnings.append(f"Legislature document discovery failed: {exc}")
-        documents = {"status": None, "budget": None, "directories": []}
+
+    if documents["status"]:
+        try:
+            status_path = download_document(documents["status"].url, work_dir / "gf-status.pdf", "pdf")
+        except Exception as exc:
+            warnings.append(f"Current General Fund status download failed: {exc}")
+    if documents["budget"]:
+        try:
+            budget_path = download_document(documents["budget"].url, work_dir / "budget-report.pdf", "pdf")
+        except Exception as exc:
+            warnings.append(f"Legislative budget report download failed: {exc}")
+    for index, link in enumerate(documents["directories"]):
+        try:
+            directory_paths.append(download_document(link.url, work_dir / f"lfo-directory-{index}.pdf", "pdf"))
+        except Exception as exc:
+            warnings.append(f"LFO directory volume skipped: {exc}")
 
     try:
         gf = parse_gf_status(status_path or budget_path, target or date.today())
-        gf_url = documents["status"].url if status_path and documents["status"] else documents["budget"].url
-        gf_period = documents["status"].text if status_path and documents["status"] else documents["budget"].text
+        gf_link = documents["status"] if status_path else documents["budget"]
+        gf_url = gf_link.url if gf_link else CURRENT_GF_STATUS_URL
+        gf_period = gf_link.text if gf_link else "Current General Fund Status"
         sources["generalFundStatus"] = _source(
             "Nebraska Legislature General Fund Financial Status",
             gf_url,
