@@ -41,6 +41,35 @@ class ParserTests(unittest.TestCase):
         self.assertLess(abs(result['macro']['totalInterest']), 100_000)
         self.assertEqual(result['macro']['effectiveYield'], '3.14175%')
 
+    def test_fund_history_replaces_same_month_and_appends_new_month(self):
+        previous = [{
+            'id': '22980',
+            'balance': 10_000_000,
+            'interest': -25_000,
+            'history': [{
+                'period': '2026-05',
+                'label': 'May 2026',
+                'balance': 9_500_000,
+                'interest': -20_000,
+            }],
+        }]
+        june = scraper.merge_fund_history(
+            [{'id': '22980', 'balance': 10_000_000, 'interest': -25_000}],
+            previous,
+            date(2026, 6, 30),
+        )
+        self.assertEqual(len(june[0]['history']), 2)
+        self.assertEqual(june[0]['delta'], 500_000)
+
+        corrected_june = scraper.merge_fund_history(
+            [{'id': '22980', 'balance': 10_250_000, 'interest': -26_000}],
+            june,
+            date(2026, 6, 30),
+        )
+        self.assertEqual(len(corrected_june[0]['history']), 2)
+        self.assertEqual(corrected_june[0]['history'][-1]['balance'], 10_250_000)
+        self.assertEqual(corrected_june[0]['delta'], 750_000)
+
     def test_gf_status_accepts_positive_current_reserve_variance(self):
         text = '''
 General Fund Financial Status

@@ -18,6 +18,11 @@ Each section carries its own source URL and reporting period. Source failures re
 the last known-good section and add a visible warning instead of replacing valid data
 with zeros or guessed values.
 
+The **Fund Review** view ranks substantial non-General Fund balances for legislative
+review, supports multi-fund selection and combined totals, and links each balance to
+its agency, statutory authority, and stated purpose. The scraper retains newly
+published monthly OIP balances so movement signals become available over time.
+
 ## Local development
 
 ```bash
