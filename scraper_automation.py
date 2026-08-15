@@ -406,6 +406,54 @@ def parse_oip(path: Path) -> dict:
     return parse_oip_xlsx(path) if path.suffix.lower() == ".xlsx" else parse_oip_pdf(path)
 
 
+def merge_fund_history(current_funds: list[dict], previous_funds: list[dict], report_date: date) -> list[dict]:
+    """Attach a compact monthly OIP history without inventing missing periods.
+
+    The OIP publishes average daily balances, not point-in-time cash balances. A
+    repeated weekly refresh for the same report month replaces that month's
+    point; a newly published month appends one point and calculates the change
+    from the prior published month. Twenty-four months are retained.
+    """
+    previous_by_id = {str(fund.get("id")): fund for fund in previous_funds or []}
+    period = report_date.strftime("%Y-%m")
+    label = report_date.strftime("%b %Y")
+    merged: list[dict] = []
+
+    for fund in current_funds:
+        item = dict(fund)
+        prior = previous_by_id.get(str(item.get("id")), {})
+        history = []
+        for point in prior.get("history", []) or []:
+            point_period = str(point.get("period") or "")
+            point_balance = point.get("balance")
+            if point_balance is None and point.get("b") is not None:
+                point_balance = float(point["b"]) * 1_000_000
+            if not point_period or point_balance is None:
+                continue
+            history.append({
+                "period": point_period,
+                "label": point.get("label") or point.get("m") or point_period,
+                "balance": round(float(point_balance), 2),
+                "interest": round(float(point.get("interest") or 0), 2),
+            })
+
+        current_point = {
+            "period": period,
+            "label": label,
+            "balance": round(float(item.get("balance") or 0), 2),
+            "interest": round(float(item.get("interest") or 0), 2),
+        }
+        history = [point for point in history if point["period"] != period]
+        history.append(current_point)
+        history = sorted(history, key=lambda point: point["period"])[-24:]
+
+        item["history"] = history
+        item["delta"] = round(history[-1]["balance"] - history[-2]["balance"], 2) if len(history) > 1 else 0
+        merged.append(item)
+
+    return merged
+
+
 # Legislature reports
 
 def discover_legislature_documents(links: Iterable[Link]) -> dict:
@@ -851,6 +899,7 @@ def build_dashboard(output: Path, target: date | None = None) -> dict:
     try:
         oip_path, oip_date, oip_url = fetch_oip(work_dir, target)
         oip = parse_oip(oip_path)
+        oip["funds"] = merge_fund_history(oip["funds"], previous.get("funds", []), oip_date)
         sources["cashPool"] = _source("DAS Operating Investment Pool", oip_url, oip_date.strftime("%B %Y"))
     except Exception as exc:
         oip = keep_or_raise(previous, ("macro", "funds"), f"OIP refresh failed: {exc}", warnings)

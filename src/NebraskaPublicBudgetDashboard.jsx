@@ -31,6 +31,7 @@ const TABS = [
   { id: 'revenue', icon: TrendingUp, label: 'Revenue' },
   { id: 'gfstatus', icon: Scale, label: 'GF Status' },
   { id: 'agencies', icon: Building2, label: 'Agencies' },
+  { id: 'review', icon: Search, label: 'Fund Review' },
   { id: 'funds', icon: Database, label: 'Fund Explorer' },
   { id: 'reference', icon: BookOpen, label: 'Reference' },
 ];
@@ -45,6 +46,7 @@ function fmt(v) { if (v == null || isNaN(v)) return '$0'; return new Intl.Number
 function fmtC(v) { if (v == null || isNaN(v)) return '$0'; const n = Number(v), a = Math.abs(n); if (a >= 1e9) return `$${(n / 1e9).toFixed(2)}B`; if (a >= 1e6) return `$${(n / 1e6).toFixed(1)}M`; if (a >= 1e3) return `$${(n / 1e3).toFixed(0)}K`; return fmt(n); }
 function fmtP(d) { return isNaN(d) ? '0%' : `${(d * 100).toFixed(1)}%`; }
 function getCat(id) { return { 1: 'General', 2: 'Cash', 3: 'Construction', 4: 'Federal', 5: 'Revolving', 6: 'Trust', 7: 'Distributive', 8: 'Suspense' }[String(id || '').charAt(0)] || 'Unknown'; }
+function cleanLabel(value) { return String(value || '').replace(/^\s*[–—-]\s*/, '').trim(); }
 
 /* ═══════════════════ ERROR BOUNDARY ═══════════════════ */
 
@@ -96,13 +98,19 @@ function normalizeData(raw) {
   // Pass 1: active funds from OIP
   (safe.funds || []).forEach((f) => {
     const id = String(f.id);
+    const history = (f.history || []).map((point) => {
+      const balance = Number(point.balance ?? (Number(point.b || 0) * 1e6)) || 0;
+      const label = point.label || point.m || point.period || '';
+      return { ...point, label, m: label, balance, b: balance / 1e6, interest: Number(point.interest ?? 0) || 0 };
+    });
+    const calculatedDelta = history.length > 1 ? history[history.length - 1].balance - history[history.length - 2].balance : 0;
     seen.set(id, {
-      id, title: f.title || `Fund ${id}`,
+      id, title: cleanLabel(f.title) || `Fund ${id}`,
       balance: Number(f.balance ?? 0) || 0, interest: Number(f.interest ?? 0) || 0,
-      delta: Number(f.delta ?? 0) || 0, approp: Number(f.approp ?? 0) || 0, expended: Number(f.expended ?? 0) || 0,
+      delta: Number(f.delta ?? calculatedDelta) || 0, approp: Number(f.approp ?? 0) || 0, expended: Number(f.expended ?? 0) || 0,
       description: f.description || '', statutory_authority: f.statutory_authority || '',
-      agency_name: f.agency_name || '', program: f.program || '',
-      history: f.history || [], ending_balance: f.ending_balance ?? null,
+      agency_name: cleanLabel(f.agency_name), program: f.program || '',
+      history, ending_balance: f.ending_balance ?? null,
       category: getCat(id), dormant: false, hasOipEntry: f.hasOipEntry !== false,
     });
   });
@@ -113,19 +121,19 @@ function normalizeData(raw) {
     if (seen.has(sId)) {
       const existing = seen.get(sId);
       // ALWAYS overwrite the generic OIP title with the rich LFO title
-      if (desc.title) existing.title = desc.title;
+      if (desc.title) existing.title = cleanLabel(desc.title);
       if (!existing.description && desc.description) existing.description = desc.description;
       if (!existing.statutory_authority && desc.statutory_authority) existing.statutory_authority = desc.statutory_authority;
-      if (!existing.agency_name && desc.agency_name) existing.agency_name = desc.agency_name;
+      if (!existing.agency_name && desc.agency_name) existing.agency_name = cleanLabel(desc.agency_name);
       if (!existing.program && desc.program) existing.program = desc.program;
       if (existing.ending_balance == null && desc.ending_balance != null) existing.ending_balance = desc.ending_balance;
     } else {
       // Directory-only record. Absence from OIP does not establish inactivity.
       seen.set(sId, {
-        id: sId, title: desc.title || `Fund ${sId}`,
+        id: sId, title: cleanLabel(desc.title) || `Fund ${sId}`,
         balance: 0, interest: 0, delta: 0, approp: 0, expended: 0,
         description: desc.description || '', statutory_authority: desc.statutory_authority || '',
-        agency_name: desc.agency_name || '', program: desc.program || '',
+        agency_name: cleanLabel(desc.agency_name), program: desc.program || '',
         history: [], ending_balance: desc.ending_balance ?? null,
         category: getCat(sId), dormant: true, hasOipEntry: false,
       });
@@ -484,6 +492,142 @@ function AgenciesTab({ agencies, population = NE_POP_FALLBACK }) {
   </div>;
 }
 
+/* ═══════════════════ LEGISLATIVE FUND REVIEW ═══════════════════ */
+
+function reviewSignal(fund) {
+  const history = fund.history || [];
+  if (history.length < 2) return { label: 'Trend building', color: C.s500, bg: C.s100 };
+  const balances = history.map((point) => Number(point.balance || 0));
+  const latest = Math.abs(balances[balances.length - 1]) || 1;
+  const range = Math.max(...balances) - Math.min(...balances);
+  if (history.length >= 3 && range / latest <= 0.01) return { label: 'Little movement', color: '#92400E', bg: C.amberDim };
+  if (fund.delta > 0) return { label: 'Balance increased', color: '#047857', bg: C.emeraldDim };
+  if (fund.delta < 0) return { label: 'Balance declined', color: '#991B1B', bg: C.redDim };
+  return { label: 'No monthly change', color: '#92400E', bg: C.amberDim };
+}
+
+function FundReviewTab({ funds, onNav }) {
+  const [rawSearch, setRawSearch] = useState('');
+  const search = useDebounce(rawSearch);
+  const [category, setCategory] = useState('Cash');
+  const [minimum, setMinimum] = useState(10000000);
+  const [sortBy, setSortBy] = useState('balance');
+  const [selected, setSelected] = useState(() => new Set());
+
+  const categories = useMemo(() => {
+    const available = [...new Set(funds.filter((fund) => !fund.dormant && fund.category !== 'General').map((fund) => fund.category))];
+    return ['All non-General', ...available.sort()];
+  }, [funds]);
+
+  const candidates = useMemo(() => {
+    const needle = search.toLowerCase();
+    const result = funds.filter((fund) => {
+      if (fund.dormant || fund.category === 'General' || fund.balance < minimum) return false;
+      if (category !== 'All non-General' && fund.category !== category) return false;
+      const haystack = `${fund.id} ${fund.title} ${fund.agency_name} ${fund.description} ${fund.statutory_authority}`.toLowerCase();
+      return !needle || haystack.includes(needle);
+    });
+    return result.sort((a, b) => {
+      if (sortBy === 'interest') return Math.abs(b.interest) - Math.abs(a.interest) || b.balance - a.balance;
+      if (sortBy === 'change') return b.delta - a.delta || b.balance - a.balance;
+      if (sortBy === 'movement') {
+        const aMovement = a.history.length > 1 ? Math.abs(a.delta) / (Math.abs(a.balance) || 1) : Number.POSITIVE_INFINITY;
+        const bMovement = b.history.length > 1 ? Math.abs(b.delta) / (Math.abs(b.balance) || 1) : Number.POSITIVE_INFINITY;
+        return aMovement - bMovement || b.balance - a.balance;
+      }
+      return b.balance - a.balance;
+    });
+  }, [funds, search, category, minimum, sortBy]);
+
+  const selectedFunds = useMemo(() => funds.filter((fund) => selected.has(fund.id)), [funds, selected]);
+  const visibleBalance = candidates.reduce((sum, fund) => sum + fund.balance, 0);
+  const visibleInterest = candidates.reduce((sum, fund) => sum + Math.abs(fund.interest), 0);
+  const selectedBalance = selectedFunds.reduce((sum, fund) => sum + fund.balance, 0);
+  const selectedInterest = selectedFunds.reduce((sum, fund) => sum + Math.abs(fund.interest), 0);
+  const exportFunds = selectedFunds.length ? selectedFunds : candidates;
+
+  const toggleFund = (id) => setSelected((current) => {
+    const next = new Set(current);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+
+  const selectVisible = () => setSelected(new Set(candidates.map((fund) => fund.id)));
+
+  return <div style={{ display: 'grid', gap: 18 }}>
+    <div>
+      <div style={{ fontSize: 22, fontWeight: 900, color: C.navy }}>Legislative Fund Review</div>
+      <Narrative>
+        Find substantial balances that may warrant a legislative question. Select funds to total their latest Operating Investment Pool average daily balances, then open the Fund Explorer for statutory purpose and agency context.
+      </Narrative>
+    </div>
+
+    <div style={{ ...panel, borderLeft: `4px solid ${C.gold}`, background: C.goldDim }}>
+      <div style={{ fontSize: 12.5, color: '#713F12', lineHeight: 1.7 }}>
+        <strong>A review candidate is not a finding that money is legally available, inactive, unobligated, or transferable.</strong> The queue uses official OIP average daily balances and LFO directory information to identify where further legislative review may be useful.
+      </div>
+    </div>
+
+    <div className="metric-grid">
+      <MetricCard label="Funds in review" value={candidates.length.toLocaleString()} />
+      <MetricCard label="Combined OIP ADB" value={fmtC(visibleBalance)} />
+      <MetricCard label="Monthly allocated interest" value={fmtC(visibleInterest)} />
+      <MetricCard label={selectedFunds.length ? `${selectedFunds.length} selected` : 'Selected total'} value={selectedFunds.length ? fmtC(selectedBalance) : '—'} sub={selectedFunds.length ? <span style={{ fontSize: 11.5, color: C.s500 }}>{fmtC(selectedInterest)} monthly allocated interest</span> : null} />
+    </div>
+
+    <div style={card}>
+      <div style={{ padding: 18, borderBottom: `1px solid ${C.s200}`, background: C.s50 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+          <div style={{ fontWeight: 800, color: C.navy }}>Review queue</div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button type="button" onClick={selectVisible} disabled={!candidates.length} style={{ border: `1px solid ${C.s300}`, background: '#fff', color: C.s700, borderRadius: 7, padding: '5px 10px', cursor: candidates.length ? 'pointer' : 'default', fontSize: 11.5, fontWeight: 700 }}>Select visible</button>
+            {selectedFunds.length > 0 && <button type="button" onClick={() => setSelected(new Set())} style={{ border: `1px solid ${C.s300}`, background: '#fff', color: C.s700, borderRadius: 7, padding: '5px 10px', cursor: 'pointer', fontSize: 11.5, fontWeight: 700 }}>Clear selection</button>}
+            <ExportBtn onClick={() => downloadCsv('ne_legislative_fund_review.csv', ['Fund', 'Title', 'Category', 'OIP Average Daily Balance', 'Allocated Interest', 'Month-over-Month Change', 'Agency', 'Statutory Authority', 'Purpose', 'Review Signal'], exportFunds.map((fund) => [fund.id, fund.title, fund.category, fund.balance, fund.interest, fund.delta, fund.agency_name, fund.statutory_authority, fund.description, reviewSignal(fund).label]))} />
+          </div>
+        </div>
+
+        <div style={{ position: 'relative', marginTop: 12 }}><Search style={{ width: 15, height: 15, color: C.s400, position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)' }} /><input value={rawSearch} onChange={(event) => setRawSearch(event.target.value)} placeholder="Search fund, agency, purpose, or statute..." style={{ width: '100%', padding: '10px 12px 10px 32px', borderRadius: 10, border: `1px solid ${C.s300}`, background: '#fff' }} /></div>
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14, alignItems: 'flex-end', flexWrap: 'wrap', marginTop: 12 }}>
+          <div>
+            <div style={{ fontSize: 10, color: C.s500, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>Fund type</div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>{categories.map((item) => <button key={item} type="button" onClick={() => setCategory(item)} style={{ border: category === item ? 'none' : `1px solid ${C.s300}`, background: category === item ? C.navy : '#fff', color: category === item ? '#fff' : C.s700, borderRadius: 999, padding: '5px 10px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>{item}</button>)}</div>
+          </div>
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+            <label style={{ fontSize: 11, color: C.s500 }}>Minimum balance<br /><select value={minimum} onChange={(event) => setMinimum(Number(event.target.value))} style={{ marginTop: 5, border: `1px solid ${C.s300}`, borderRadius: 7, padding: '6px 9px', background: '#fff', color: C.s700 }}><option value={1000000}>$1 million</option><option value={10000000}>$10 million</option><option value={25000000}>$25 million</option><option value={50000000}>$50 million</option></select></label>
+            <label style={{ fontSize: 11, color: C.s500 }}>Sort by<br /><select value={sortBy} onChange={(event) => setSortBy(event.target.value)} style={{ marginTop: 5, border: `1px solid ${C.s300}`, borderRadius: 7, padding: '6px 9px', background: '#fff', color: C.s700 }}><option value="balance">Largest balance</option><option value="interest">Most interest</option><option value="change">Largest increase</option><option value="movement">Least movement</option></select></label>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ overflowX: 'auto' }}>
+        <table className="review-table" style={{ width: '100%', borderCollapse: 'collapse', minWidth: 940 }}>
+          <thead><tr>{['', 'Fund', 'Agency / statutory authority', 'OIP average daily balance', 'Allocated interest', 'Monthly change', 'Signal', ''].map((heading, index) => <th key={`${heading}-${index}`} style={{ padding: '10px 12px', textAlign: index >= 3 && index <= 5 ? 'right' : 'left', fontSize: 10, color: C.s500, textTransform: 'uppercase', letterSpacing: .8, borderBottom: `1px solid ${C.s200}`, background: '#fff' }}>{heading}</th>)}</tr></thead>
+          <tbody>{candidates.map((fund) => {
+            const signal = reviewSignal(fund);
+            return <tr key={fund.id} style={{ background: selected.has(fund.id) ? C.blueDim : '#fff' }}>
+              <td style={{ padding: 12, borderBottom: `1px solid ${C.s100}` }}><input type="checkbox" aria-label={`Select ${fund.title}`} checked={selected.has(fund.id)} onChange={() => toggleFund(fund.id)} /></td>
+              <td style={{ padding: 12, borderBottom: `1px solid ${C.s100}`, maxWidth: 300 }}><div style={{ fontSize: 12.5, fontWeight: 800, color: C.navy }}>{fund.title}</div><div style={{ fontSize: 10.5, color: C.s400, marginTop: 3 }}>Fund {fund.id} · {fund.category}</div></td>
+              <td style={{ padding: 12, borderBottom: `1px solid ${C.s100}`, maxWidth: 280 }}><div style={{ fontSize: 11.5, color: C.s700 }}>{fund.agency_name || 'Agency not identified'}</div><div style={{ fontSize: 10.5, color: C.s400, marginTop: 3 }}>{fund.statutory_authority || 'Statutory authority not provided'}</div></td>
+              <td style={{ padding: 12, borderBottom: `1px solid ${C.s100}`, textAlign: 'right', fontSize: 13, fontWeight: 900, color: C.s900 }}>{fmtC(fund.balance)}</td>
+              <td style={{ padding: 12, borderBottom: `1px solid ${C.s100}`, textAlign: 'right', fontSize: 12, fontWeight: 700 }}>{fmtC(Math.abs(fund.interest))}</td>
+              <td style={{ padding: 12, borderBottom: `1px solid ${C.s100}`, textAlign: 'right' }}>{fund.history.length > 1 ? (fund.delta === 0 ? <span style={{ fontSize: 11.5, color: C.s500 }}>No change</span> : <Delta value={fund.delta} compact />) : <span style={{ fontSize: 10.5, color: C.s400 }}>Next report</span>}</td>
+              <td style={{ padding: 12, borderBottom: `1px solid ${C.s100}` }}><Badge text={signal.label.toUpperCase()} color={signal.color} bg={signal.bg} /></td>
+              <td style={{ padding: 12, borderBottom: `1px solid ${C.s100}` }}><button type="button" onClick={() => onNav('funds', fund.id)} style={{ border: `1px solid ${C.s300}`, background: '#fff', color: C.navy, borderRadius: 7, padding: '5px 9px', cursor: 'pointer', fontSize: 11, fontWeight: 700 }}>Details</button></td>
+            </tr>;
+          })}</tbody>
+        </table>
+        {candidates.length === 0 && <div style={{ padding: 40, textAlign: 'center', color: C.s400 }}>No funds match the current review filters.</div>}
+      </div>
+    </div>
+
+    <div style={{ ...panel, background: C.s50 }}>
+      <div style={{ fontWeight: 800, color: C.navy, marginBottom: 6 }}>How the trend signal works</div>
+      <div style={{ fontSize: 12.5, color: C.s500, lineHeight: 1.7 }}>The dashboard now preserves each newly published monthly OIP balance. After two reports it will show month-over-month change; after three reports it can flag balances with little movement. It does not infer obligations or legal availability from cash movement alone.</div>
+    </div>
+  </div>;
+}
+
 /* ═══════════════════ FUND EXPLORER ═══════════════════ */
 
 function FundsTab({ funds, selectedId, onSelect, showDormantInit = false }) {
@@ -563,7 +707,7 @@ function ReferenceTab({ data }) {
   const population = data.population?.value || NE_POP_FALLBACK;
   const secs = [
     { t: 'Fund Types', items: [{ t: 'General Fund (10000)', d: 'Receipts not earmarked by statute, including major income and sales taxes.' }, { t: 'Cash Funds (20000s)', d: 'Dedicated fees and charges restricted to statutory purposes.' }, { t: 'Federal Funds (40000s)', d: 'Grants, contracts, and matching funds from the federal government.' }, { t: 'Revolving Funds (50000s)', d: 'Interagency transactions where one agency provides goods or services to another.' }, { t: 'Trust Funds (60000s)', d: 'Fiduciary funds held for individuals or entities.' }, { t: 'Reference-only record', d: 'Listed in the LFO directory but absent from the latest OIP report. This is not a finding that the fund is dormant.' }] },
-    { t: 'Budget Terms', items: [{ t: 'Average Daily Balance (ADB)', d: 'Weighted average cash held in a fund over the reporting month; this is not a point-in-time ending balance.' }, { t: 'NEFAB', d: 'Nebraska Economic Forecasting Advisory Board, which establishes official General Fund revenue forecasts.' }, { t: 'Minimum Reserve', d: 'A statutory 3% minimum reserve calculation at the end of a biennium.' }, { t: 'Per Capita', d: `Divided by the Census Bureau's July 1, 2025 Nebraska population estimate (${(population / 1e6).toFixed(2)}M).` }] },
+    { t: 'Budget Terms', items: [{ t: 'Average Daily Balance (ADB)', d: 'Weighted average cash held in a fund over the reporting month; this is not a point-in-time ending balance.' }, { t: 'Legislative Fund Review', d: 'A screening queue for substantial non-General Fund balances. Inclusion identifies a question for further review, not a finding that money is inactive, unobligated, available, or transferable.' }, { t: 'NEFAB', d: 'Nebraska Economic Forecasting Advisory Board, which establishes official General Fund revenue forecasts.' }, { t: 'Minimum Reserve', d: 'A statutory 3% minimum reserve calculation at the end of a biennium.' }, { t: 'Per Capita', d: `Divided by the Census Bureau's July 1, 2025 Nebraska population estimate (${(population / 1e6).toFixed(2)}M).` }] },
     { t: 'Data Sources', items: [{ t: 'OIP Report', d: 'Monthly average daily balances and allocated interest from DAS State Accounting.' }, { t: 'General Fund Financial Status', d: 'Official legislative snapshot; it updates on a different schedule from monthly revenue reports.' }, { t: 'Current Fiscal Year Budget', d: 'Agency appropriations by General, Cash, Construction, Federal, and Revolving funds.' }, { t: 'LFO Directory', d: 'Legislative Fiscal Office reference information and statutory authority for state funds.' }] },
   ];
   return <div style={{ display: 'grid', gap: 18 }}><div><div style={{ fontSize: 20, fontWeight: 900, color: C.navy }}>Reference & Definitions</div></div>
@@ -698,8 +842,8 @@ export default function NebraskaBudgetDashboard() {
         .three-col { display: grid; gap: 18px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
         .fund-layout { display: grid; gap: 18px; grid-template-columns: minmax(0, 1.35fr) minmax(320px, .9fr); align-items: start; }
         @media (max-width: 980px) { .two-col, .three-col, .fund-layout { grid-template-columns: 1fr; } }
-        button, input { font: inherit; }
-        input:focus, button:focus-visible { outline: 2px solid ${C.gold}; outline-offset: 1px; }
+        button, input, select { font: inherit; }
+        input:focus, select:focus, button:focus-visible { outline: 2px solid ${C.gold}; outline-offset: 1px; }
       `}</style>
 
       <header style={{ background: `linear-gradient(135deg, ${C.navy}, ${C.navyMid}, ${C.navyLight})`, color: '#fff' }}>
@@ -743,6 +887,7 @@ export default function NebraskaBudgetDashboard() {
           {tab === 'revenue' && <RevenueTab revenue={data.revenue} />}
           {tab === 'gfstatus' && <GFStatusTab data={data} />}
           {tab === 'agencies' && <AgenciesTab agencies={data.agencies} population={data.population?.value || NE_POP_FALLBACK} />}
+          {tab === 'review' && <FundReviewTab funds={data.funds} onNav={navigate} />}
           {tab === 'funds' && <FundsTab funds={data.funds} selectedId={selectedFundId} onSelect={selectFund} showDormantInit={showDormantInit} />}
           {tab === 'reference' && <ReferenceTab data={data} />}
         </ErrorBoundary>
