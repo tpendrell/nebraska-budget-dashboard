@@ -142,6 +142,25 @@ Total Net Receipts 430,750,750 373,255,035 (57,495,714) 430,750,750 373,255,035 
         self.assertEqual(result['monthlySeries'][0]['actual'], 373_255_035)
         self.assertEqual(result['nefabBasis'], 'February 27, 2026')
 
+    def test_revenue_series_preloads_forecast_and_retains_actuals(self):
+        july = scraper.merge_monthly_revenue_series({
+            'period': 'July 2026',
+            'monthlySeries': [{'month': 'July', 'actual': 373_255_035, 'forecast': 373_657_000}],
+        })
+        self.assertEqual(july['fiscalYear'], 'FY2026-27')
+        self.assertEqual(len(july['monthlySeries']), 12)
+        self.assertEqual(july['monthlySeries'][0]['actual'], 373_255_035)
+        self.assertEqual(july['monthlySeries'][1]['forecast'], 645_369_000)
+        self.assertIsNone(july['monthlySeries'][1]['actual'])
+
+        august = scraper.merge_monthly_revenue_series({
+            'period': 'August 2026',
+            'monthlySeries': [{'month': 'August', 'actual': 650_000_000, 'forecast': 645_369_000}],
+        }, july)
+        self.assertEqual(august['monthlySeries'][0]['actual'], 373_255_035)
+        self.assertEqual(august['monthlySeries'][1]['actual'], 650_000_000)
+        self.assertIsNone(august['monthlySeries'][2]['actual'])
+
     def test_agencies_include_all_fund_types(self):
         rows = ''.join(
             f'<tr><td>Agency {i}</td><td>$1,000,000</td><td>$200,000</td><td>$10,000</td>'

@@ -7,6 +7,7 @@ on:
   push:
     paths:
       - 'scraper_automation.py'
+      - 'revenue_forecasts.json'
       - '.github/workflows/monthly_scraper.yml'
   workflow_dispatch:
     inputs:

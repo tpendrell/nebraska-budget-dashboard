@@ -148,7 +148,11 @@ function normalizeData(raw) {
     ytdActual: Number(rs.ytdActual ?? 0) || 0, ytdForecast: Number(rs.ytdForecast ?? 0) || 0,
     categories: (rs.categories || []).map((c) => ({ name: c.name || '', actual: Number(c.actual ?? 0) || 0, forecast: Number(c.forecast ?? 0) || 0 })),
     nefabForecasts: rs.nefabForecasts || [],
-    monthlySeries: (rs.monthlySeries || []).map((m) => ({ month: m.month, actual: Number(m.actual ?? 0) || 0, forecast: Number(m.forecast ?? 0) || 0 })),
+    monthlySeries: (rs.monthlySeries || []).map((m) => ({
+      month: m.month,
+      actual: m.actual == null ? null : Number(m.actual) || 0,
+      forecast: Number(m.forecast ?? 0) || 0,
+    })),
   };
 
   // Defensive defaults for GF Status and related structures
@@ -361,11 +365,11 @@ function RevenueTab({ revenue }) {
         <div style={{ fontWeight: 800, color: C.navy, marginBottom: 14 }}>Monthly net receipts vs. forecast</div>
         <div style={{ height: 260 }}><ResponsiveContainer width="100%" height="100%"><BarChart data={revenue.monthlySeries} barGap={4}>
           <CartesianGrid vertical={false} strokeDasharray="3 3" stroke={C.s200} />
-          <XAxis dataKey="month" tick={{ fill: C.s500, fontSize: 11 }} axisLine={false} tickLine={false} />
+          <XAxis dataKey="month" tick={{ fill: C.s500, fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={(m) => String(m).slice(0, 3)} />
           <YAxis tick={{ fill: C.s500, fontSize: 11 }} axisLine={false} tickLine={false} width={48} tickFormatter={(v) => `$${Math.round(v / 1e6)}M`} />
           <ReTooltip formatter={(v) => fmt(v)} />
           <Bar dataKey="forecast" fill={C.s200} radius={[4, 4, 0, 0]} name="Forecast" />
-          <Bar dataKey="actual" radius={[4, 4, 0, 0]} name="Actual">{revenue.monthlySeries.map((d, i) => <Cell key={i} fill={d.actual >= d.forecast ? C.emerald : C.amber} />)}</Bar>
+          <Bar dataKey="actual" radius={[4, 4, 0, 0]} name="Actual">{revenue.monthlySeries.map((d, i) => <Cell key={i} fill={d.actual == null ? 'transparent' : d.actual >= d.forecast ? C.emerald : C.amber} />)}</Bar>
         </BarChart></ResponsiveContainer></div>
       </div>
       {revenue.categories.length > 0 && <div style={panel}>

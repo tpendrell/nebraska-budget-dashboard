@@ -1,0 +1,21 @@
+{
+  "FY2026-27": {
+    "basis": "February 27, 2026",
+    "certified": "July 13, 2026",
+    "source": "https://revenue.nebraska.gov/sites/default/files/doc/news-release/gen-fund/2026/General_Fund_Receipts_News_Release_July_2026_Final_Copy.pdf",
+    "monthlyNetReceipts": [
+      { "month": "July", "forecast": 373657000 },
+      { "month": "August", "forecast": 645369000 },
+      { "month": "September", "forecast": 681932000 },
+      { "month": "October", "forecast": 349236000 },
+      { "month": "November", "forecast": 624057000 },
+      { "month": "December", "forecast": 894377000 },
+      { "month": "January", "forecast": 578140000 },
+      { "month": "February", "forecast": 447751000 },
+      { "month": "March", "forecast": 445769000 },
+      { "month": "April", "forecast": 608499000 },
+      { "month": "May", "forecast": 564487000 },
+      { "month": "June", "forecast": 568515000 }
+    ]
+  }
+}

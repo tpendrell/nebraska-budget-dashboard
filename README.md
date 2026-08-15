@@ -23,6 +23,10 @@ review, supports multi-fund selection and combined totals, and links each balanc
 its agency, statutory authority, and stated purpose. The scraper retains newly
 published monthly OIP balances so movement signals become available over time.
 
+The Revenue view preloads the official July-through-June monthly forecast from
+`revenue_forecasts.json`. Each new Department of Revenue release adds that month's
+actual receipts while future months remain blank rather than displaying as zero.
+
 ## Local development
 
 ```bash

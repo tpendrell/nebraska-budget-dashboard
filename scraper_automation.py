@@ -34,6 +34,7 @@ REVENUE_REPORTS_URL = (
     "https://revenue.nebraska.gov/about/news-releases/"
     "general-fund-receipts-news-releases"
 )
+REVENUE_FORECASTS_PATH = Path(__file__).with_name("revenue_forecasts.json")
 AGENCY_BUDGET_URL = "https://statespending.nebraska.gov/CurrentFiscalYearBudget"
 CENSUS_POPULATION_URL = "https://www.census.gov/quickfacts/fact/table/NE/PST045225"
 NEBRASKA_POPULATION = 2_018_006
@@ -672,6 +673,10 @@ def parse_lfo_directory(paths: Iterable[Path]) -> dict:
 # Department of Revenue monthly receipts
 
 MONTHS = {name.lower(): index for index, name in enumerate(calendar.month_name) if name}
+FISCAL_MONTHS = [
+    "July", "August", "September", "October", "November", "December",
+    "January", "February", "March", "April", "May", "June",
+]
 REVENUE_RE = re.compile(r"General_Fund_Receipts_News_Release_([A-Za-z]+)_(20\d{2}).*\.pdf$", re.I)
 
 
@@ -688,6 +693,83 @@ def discover_revenue_release(links: Iterable[Link], target: date | None = None) 
     if not reports:
         raise SourceError("No monthly General Fund receipts PDF was found on the Revenue index page")
     return max(reports, key=lambda item: item[0])
+
+
+def revenue_fiscal_year(period: str) -> str:
+    match = re.fullmatch(r"\s*([A-Za-z]+)\s+(20\d{2})\s*", period)
+    if not match or match.group(1).lower() not in MONTHS:
+        return ""
+    month = MONTHS[match.group(1).lower()]
+    year = int(match.group(2))
+    start_year = year if month >= 7 else year - 1
+    return f"FY{start_year}-{str(start_year + 1)[-2:]}"
+
+
+def load_revenue_forecast(fiscal_year: str, path: Path = REVENUE_FORECASTS_PATH) -> dict:
+    if not fiscal_year or not path.exists():
+        return {}
+    try:
+        forecasts = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SourceError(f"Monthly revenue forecast file could not be read: {exc}") from exc
+    schedule = forecasts.get(fiscal_year, {})
+    rows = schedule.get("monthlyNetReceipts", [])
+    months = [row.get("month") for row in rows]
+    if schedule and months != FISCAL_MONTHS:
+        raise SourceError(f"Monthly revenue forecast for {fiscal_year} must contain July through June in order")
+    if any(not isinstance(row.get("forecast"), (int, float)) or row["forecast"] < 0 for row in rows):
+        raise SourceError(f"Monthly revenue forecast for {fiscal_year} contains an invalid amount")
+    return schedule
+
+
+def merge_monthly_revenue_series(current: dict, previous: dict | None = None) -> dict:
+    """Preload the certified forecast and retain actuals as monthly releases arrive."""
+    fiscal_year = revenue_fiscal_year(current.get("period", ""))
+    current["fiscalYear"] = fiscal_year
+    schedule = load_revenue_forecast(fiscal_year)
+    rows = [
+        {"month": row["month"], "actual": None, "forecast": round(row["forecast"])}
+        for row in schedule.get("monthlyNetReceipts", [])
+    ]
+    if not rows:
+        rows = [
+            {
+                "month": row.get("month", ""),
+                "actual": row.get("actual"),
+                "forecast": round(row.get("forecast", 0)),
+            }
+            for row in current.get("monthlySeries", [])
+        ]
+    by_month = {row["month"]: row for row in rows if row.get("month")}
+
+    previous = previous or {}
+    previous_fiscal_year = previous.get("fiscalYear") or revenue_fiscal_year(previous.get("period", ""))
+    if previous_fiscal_year == fiscal_year:
+        for row in previous.get("monthlySeries", []):
+            month = row.get("month")
+            if month in by_month and row.get("actual") is not None:
+                by_month[month]["actual"] = round(row["actual"])
+
+    for row in current.get("monthlySeries", []):
+        month = row.get("month")
+        if not month:
+            continue
+        if month not in by_month:
+            by_month[month] = {"month": month, "actual": None, "forecast": 0}
+            rows.append(by_month[month])
+        if row.get("actual") is not None:
+            by_month[month]["actual"] = round(row["actual"])
+        if row.get("forecast") is not None:
+            by_month[month]["forecast"] = round(row["forecast"])
+
+    current["monthlySeries"] = rows
+    if schedule:
+        current["monthlyForecast"] = {
+            "basis": schedule.get("basis", ""),
+            "certified": schedule.get("certified", ""),
+            "source": schedule.get("source", ""),
+        }
+    return current
 
 
 def parse_revenue_text(text: str, period: str) -> dict:
@@ -962,6 +1044,7 @@ def build_dashboard(output: Path, target: date | None = None) -> dict:
         revenue = parse_revenue_text(_pdf_to_text(revenue_path), revenue_date.strftime("%B %Y"))
         if budget_path:
             revenue["nefabForecasts"] = parse_nefab_forecasts(budget_path)
+        revenue = merge_monthly_revenue_series(revenue, previous.get("revenue", {}))
         sources["revenue"] = _source(
             "Nebraska Department of Revenue General Fund Receipts", revenue_url, revenue_date.strftime("%B %Y")
         )
