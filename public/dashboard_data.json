@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-15T02:13:35Z",
+  "generatedAt": "2026-08-15T17:38:48Z",
   "lastUpdated": {
     "cash": "June 2026",
     "budget": "Current General Fund Status",
@@ -24432,10 +24432,71 @@
         "month": "July",
         "actual": 373255035,
         "forecast": 373657000
+      },
+      {
+        "month": "August",
+        "actual": null,
+        "forecast": 645369000
+      },
+      {
+        "month": "September",
+        "actual": null,
+        "forecast": 681932000
+      },
+      {
+        "month": "October",
+        "actual": null,
+        "forecast": 349236000
+      },
+      {
+        "month": "November",
+        "actual": null,
+        "forecast": 624057000
+      },
+      {
+        "month": "December",
+        "actual": null,
+        "forecast": 894377000
+      },
+      {
+        "month": "January",
+        "actual": null,
+        "forecast": 578140000
+      },
+      {
+        "month": "February",
+        "actual": null,
+        "forecast": 447751000
+      },
+      {
+        "month": "March",
+        "actual": null,
+        "forecast": 445769000
+      },
+      {
+        "month": "April",
+        "actual": null,
+        "forecast": 608499000
+      },
+      {
+        "month": "May",
+        "actual": null,
+        "forecast": 564487000
+      },
+      {
+        "month": "June",
+        "actual": null,
+        "forecast": 568515000
       }
     ],
     "nefabBasis": "February 27, 2026",
-    "nefabForecasts": []
+    "nefabForecasts": [],
+    "fiscalYear": "FY2026-27",
+    "monthlyForecast": {
+      "basis": "February 27, 2026",
+      "certified": "July 13, 2026",
+      "source": "https://revenue.nebraska.gov/sites/default/files/doc/news-release/gen-fund/2026/General_Fund_Receipts_News_Release_July_2026_Final_Copy.pdf"
+    }
   },
   "generalFundStatus": {
     "fiscalYear": "FY2026-27",
